@@ -1,0 +1,294 @@
+import XCTest
+@testable import LiveLocation
+
+/// An uplink whose next upload parks until the test releases it — the tool for proving what happens
+/// when another call runs inside `SharerSession` at its `await`.
+actor GatedUplink: RelayUplink {
+    let relay: LocationRelay
+    private var holdNext = false
+    private var parked: [CheckedContinuation<Void, Never>] = []
+    private(set) var uploads: [[SealedPoint]] = []
+    var failing = false
+
+    init(relay: LocationRelay) { self.relay = relay }
+    func holdNextUpload() { holdNext = true }
+    func setFailing(_ f: Bool) { failing = f }
+    func release() { parked.forEach { $0.resume() }; parked = [] }
+
+    func upload(_ copies: [SealedPoint]) async throws -> PublishReceipt {
+        uploads.append(copies)
+        if holdNext {
+            holdNext = false
+            await withCheckedContinuation { parked.append($0) }
+        }
+        if failing { throw URLError(.notConnectedToInternet) }
+        return await relay.publish(copies)
+    }
+
+    func revoke(_ viewer: ViewerID, from share: ShareID) async throws { await relay.revoke(viewer, from: share) }
+}
+
+final class SharerSessionTests: XCTestCase {
+    let share = ShareID("s")
+    let manifest = CapabilityManifest(capabilities: [.liveLocationSharing])
+    let walking = DeviceConditions(batteryLevel: 0.9, motion: .walking)
+    let keys = ["a", "b", "c"].map { ViewerKeys(viewerID: ViewerID($0)) }
+
+    func setUp(budget: Int = 120) async throws -> (SharerSession, GatedUplink, LocationRelay, ManualClock) {
+        let clock = ManualClock(start: Instant(millis: 1_000_000))
+        let relay = LocationRelay(configuration: RelayConfiguration(presenceTTL: .seconds(120)), clock: clock)
+        try await relay.startShare(share, viewers: Set(keys.map(\.viewerID)), duration: .hours(1))
+        var sealer = PerViewerSealer(shareID: share)
+        for k in keys { try sealer.add(k.viewerID, publicKey: k.publicKey) }
+        let uplink = GatedUplink(relay: relay)
+        let session = try SharerSession(shareID: share, manifest: manifest, sealer: sealer, uplink: uplink, clock: clock,
+                                        presenceTTL: .seconds(120), discretionaryBudget: budget, budgetRefill: .hours(1))
+        return (session, uplink, relay, clock)
+    }
+
+    func fix(_ lat: Double, _ clock: ManualClock) -> LocationFix {
+        // Force-unwrap is provably safe: callers pass |lat| < 1 and a fixed valid accuracy.
+        LocationFix(latitude: lat, longitude: 0, accuracyMeters: 5, timestamp: clock.now())!
+    }
+
+    func testSessionRefusesToExistWithoutTheDeclaredCapability() {
+        XCTAssertThrowsError(try SharerSession(shareID: share, manifest: CapabilityManifest(capabilities: [.locationForAppFeatures]),
+                                               sealer: PerViewerSealer(shareID: share), uplink: LocationRelay(),
+                                               clock: ManualClock(), presenceTTL: .seconds(120))) {
+            XCTAssertEqual($0 as? SessionError, .capabilityNotDeclared)
+        }
+    }
+
+    func testOverlappingIngestsGetIncreasingSequencesAndTheLateOneLoses() async throws {
+        let (session, uplink, relay, clock) = try await setUp()
+        _ = await session.ingest(fix(0, clock), conditions: walking)                // #1, first
+        clock.advance(by: .seconds(20))
+        await uplink.holdNextUpload()
+        let slowFix = fix(0.001, clock), conditions = walking
+        let slow = Task { await session.ingest(slowFix, conditions: conditions) }       // #2, parked
+        while await uplink.uploads.count < 2 { await Task.yield() }
+        clock.advance(by: .seconds(61))                                                  // heartbeat due
+        let fast = await session.ingest(fix(0.002, clock), conditions: walking)         // #3 — runs at #2's await
+        guard case .published(.heartbeat, let fastSeq, _) = fast else { return XCTFail("\(fast)") }
+        await uplink.release()
+        let slowOutcome = await slow.value
+        guard case .published(.moved, let slowSeq, let receipt) = slowOutcome else { return XCTFail("\(slowOutcome)") }
+        XCTAssertLessThan(slowSeq, fastSeq, "sequence numbers are assigned before the await, in call order")
+        XCTAssertEqual(Set(receipt.rejected.values), [.staleSequence], "the late upload is dropped by the relay")
+        let stored = await relay.latest(share, for: ViewerID("a"))?.sequence
+        XCTAssertEqual(stored, fastSeq)
+    }
+
+    func testRevokeDuringAnInFlightUploadStillExcludesTheViewer() async throws {
+        let (session, uplink, relay, clock) = try await setUp()
+        let carol = ViewerID("c")
+        _ = await session.ingest(fix(0, clock), conditions: walking)
+        clock.advance(by: .seconds(20))
+        await uplink.holdNextUpload()
+        let inFlightFix = fix(0.001, clock), conditions = walking
+        let inFlight = Task { await session.ingest(inFlightFix, conditions: conditions) }  // sealed for c, parked
+        while await uplink.uploads.count < 2 { await Task.yield() }
+        await session.revoke(carol)                                                    // runs at the await
+        clock.advance(by: .seconds(61))
+        _ = await session.tick(conditions: walking)
+        await uplink.release()
+        _ = await inFlight.value
+        let uploads = await uplink.uploads
+        XCTAssertEqual(uploads.count, 3)
+        guard uploads.count == 3 else { return }
+        XCTAssertTrue(uploads[1].contains { $0.viewerID == carol }, "the parked batch was sealed before the revoke")
+        XCTAssertFalse(uploads[2].contains { $0.viewerID == carol }, "nothing sealed after revoke is addressed to Carol")
+        let carolCopy = await relay.latest(share, for: carol)
+        XCTAssertNil(carolCopy, "and the late pre-revoke copy is refused by the relay")
+    }
+
+    func testOfflineOutboxKeepsOnlyTheNewestBatch() async throws {
+        let (session, uplink, relay, clock) = try await setUp()
+        await uplink.setFailing(true)
+        let first = await session.ingest(fix(0, clock), conditions: walking)
+        clock.advance(by: .seconds(20))
+        let second = await session.ingest(fix(0.001, clock), conditions: walking)
+        XCTAssertEqual(first, .heldOffline(sequence: 1))
+        XCTAssertEqual(second, .heldOffline(sequence: 2))
+        await uplink.setFailing(false)
+        let flushed = await session.flushOutbox()
+        guard case .published(.moved, let seq, _) = flushed else { return XCTFail("\(flushed)") }
+        XCTAssertEqual(seq, 2)
+        let uploads = await uplink.uploads
+        XCTAssertEqual(uploads.last?.map(\.sequence), [2, 2, 2], "one batch, the newest, to all three viewers")
+        let again = await session.flushOutbox()
+        XCTAssertEqual(again, .idle)
+        let stored = await relay.stats.storedPoints
+        XCTAssertEqual(stored, 3)
+    }
+
+    func testBudgetRunsDryButHeartbeatsContinue() async throws {
+        let (session, _, _, clock) = try await setUp(budget: 2)
+        var lat = 0.0
+        var outcomes: [IngestOutcome] = []
+        for _ in 0..<6 {
+            lat += 0.001
+            outcomes.append(await session.ingest(fix(lat, clock), conditions: walking))
+            clock.advance(by: .seconds(20))
+        }
+        let reasons = outcomes.map { o -> String in
+            switch o {
+            case .published(let r, _, _): return r.rawValue
+            case .suppressed(let s): return s.rawValue
+            default: return "other"
+            }
+        }
+        // Fixes every 20 s: two movement tokens, then suppressed until the 60 s heartbeat is owed.
+        XCTAssertEqual(reasons, ["first", "moved", "moved", "budgetExhausted", "budgetExhausted", "heartbeat"])
+        let remaining = await session.budgetRemaining
+        XCTAssertEqual(remaining, 0)
+    }
+
+    func testTickRepublishesTheLastFixWithAFreshSentAt() async throws {
+        let (session, _, relay, clock) = try await setUp()
+        let opener = PerViewerOpener(keys: keys[0])
+        let initial = await session.tick(conditions: walking)
+        XCTAssertEqual(initial, .idle, "nothing published yet, nothing to heartbeat")
+        _ = await session.ingest(fix(0.5, clock), conditions: walking)
+        let firstSent = clock.now()
+        clock.advance(by: .seconds(59))
+        let early = await session.tick(conditions: walking)
+        XCTAssertEqual(early, .idle)
+        clock.advance(by: .seconds(1))
+        let beat = await session.tick(conditions: walking)
+        guard case .published(.heartbeat, _, _) = beat else { return XCTFail("\(beat)") }
+        let latest = await relay.latest(share, for: keys[0].viewerID)
+        let stored = try XCTUnwrap(latest)
+        let payload = try opener.open(stored)
+        XCTAssertEqual(payload.fix.latitude, 0.5)
+        XCTAssertEqual(payload.fix.timestamp, firstSent, "position age is honest: the fix is the old one")
+        XCTAssertEqual(payload.sentAt, clock.now(), "presence age is fresh")
+    }
+}
+
+final class PresenceInvariantTests: XCTestCase {
+    /// Drives a stationary sharer for 10 minutes against the real relay and counts seconds in which the
+    /// relay reports `.away`. The cadence function is injected so a broken policy can be fed in.
+    func awaySeconds(cadence: (DeviceConditions, Millis) -> PublishCadence) async throws -> Int {
+        let clock = ManualClock()
+        let ttl = Millis.seconds(120)
+        let relay = LocationRelay(configuration: RelayConfiguration(presenceTTL: ttl), clock: clock)
+        let share = ShareID("p")
+        try await relay.startShare(share, viewers: [ViewerID("v")], duration: .hours(1))
+        var gate = PublishGate()
+        var seq: UInt64 = 0
+        var away = 0
+        let parked = DeviceConditions(batteryLevel: 0.05, isLowPowerMode: true, motion: .stationary)
+        let spot = try XCTUnwrap(LocationFix(latitude: 1, longitude: 1, accuracyMeters: 5, timestamp: clock.now()))
+        for second in 0..<600 {
+            let c = cadence(parked, ttl)
+            if second == 0 || gate.heartbeatDue(now: clock.now(), cadence: c) {
+                seq += 1
+                gate.commit(spot, at: clock.now())
+                _ = await relay.publish([sealedCopy("p", "v", seq)])
+            }
+            if case .away = await relay.presence(of: share) { away += 1 }
+            clock.advance(by: .seconds(1))
+        }
+        return away
+    }
+
+    func testRealPolicyNeverLetsPresenceLapseForAnOnlineSharer() async throws {
+        let away = try await awaySeconds { PublishPolicy.cadence(for: $0, presenceTTL: $1) }
+        XCTAssertEqual(away, 0)
+    }
+
+    func testTheCheckCatchesAPolicyWhoseHeartbeatOutlivesTheTTL() async throws {
+        // The obvious "save battery when parked" bug: scale the heartbeat with the battery multiplier too.
+        let away = try await awaySeconds { c, ttl in
+            let real = PublishPolicy.cadence(for: c, presenceTTL: ttl)
+            return PublishCadence(minInterval: real.minInterval, minDistanceMeters: real.minDistanceMeters,
+                                  heartbeatInterval: real.heartbeatInterval.times(PublishPolicy.batteryMultiplier(c)))
+        }
+        XCTAssertGreaterThan(away, 0, "if this ever passes at 0, the presence check above proves nothing")
+    }
+}
+
+final class FreshnessTests: XCTestCase {
+    let hb = Millis.seconds(60), ttl = Millis.seconds(120)
+
+    func classify(age: Int64?, offline: Bool = false, ended: Bool = false) -> Freshness {
+        let now = Instant(millis: 1_000_000)
+        return Freshness.classify(lastSentAt: age.map { Instant(millis: now.millis - $0 * 1_000) }, now: now,
+                                  heartbeat: hb, presenceTTL: ttl, isViewerOffline: offline, hasEnded: ended)
+    }
+
+    func testBoundaries() {
+        XCTAssertEqual(classify(age: nil), .waiting)
+        XCTAssertEqual(classify(age: 0), .live(age: .zero))
+        XCTAssertEqual(classify(age: 90), .live(age: .seconds(90)))
+        XCTAssertEqual(classify(age: 91), .delayed(age: .seconds(91)))
+        XCTAssertEqual(classify(age: 120), .delayed(age: .seconds(120)))
+        XCTAssertEqual(classify(age: 121), .stale(age: .seconds(121)))
+    }
+
+    func testViewerOfflineAndEndedWinOverAge() {
+        XCTAssertEqual(classify(age: 5, offline: true), .offline(lastKnownAge: .seconds(5)))
+        XCTAssertEqual(classify(age: nil, offline: true), .offline(lastKnownAge: nil))
+        XCTAssertEqual(classify(age: 5, offline: true, ended: true), .ended)
+        XCTAssertEqual(classify(age: 400).label, "Last seen 6m ago")
+    }
+}
+
+final class LoadModelTests: XCTestCase {
+    func testReferenceNumbersMatchAHandCalculation() {
+        // Hand calc: Hz/sharer = .55/60 + .20/15 + .05/10 + .20/5 = 0.0675 (stationary at its 60 s heartbeat).
+        let e = FanoutLoadModel.estimate(.reference(copyBytes: 200))
+        XCTAssertEqual(e.publishesPerSecond, 67.5, accuracy: 1e-9)
+        XCTAssertEqual(e.copiesPerSecond, 202.5, accuracy: 1e-9)
+        XCTAssertEqual(e.socketMessagesPerSecond, 60.75, accuracy: 1e-9)
+        XCTAssertEqual(e.ingressBytesPerSecond, 40_500, accuracy: 1e-6)
+        XCTAssertEqual(e.naiveCopiesPerSecond, 3_000, accuracy: 1e-9)
+        // 2,100 background viewers × 243 pushes/h vs × 12/h (one per 5 min).
+        XCTAssertEqual(e.pushesPerHourUnbudgeted, 510_300, accuracy: 1e-6)
+        XCTAssertEqual(e.pushesPerHourBudgeted, 25_200, accuracy: 1e-6)
+        XCTAssertEqual(e.storedBytes, 600_000)
+    }
+
+    func testHostileInputsGiveFiniteNonNegativeOutput() {
+        let e = FanoutLoadModel.estimate(LoadAssumptions(activeShares: -5, meanViewersPerShare: .nan, motionMix: [.walking: -.infinity],
+                                                         foregroundFraction: 7, copyBytes: -1, presenceTTL: .zero, pushRefill: .zero))
+        for v in [e.publishesPerSecond, e.copiesPerSecond, e.socketMessagesPerSecond, e.pushesPerHourBudgeted, e.ingressBytesPerSecond] {
+            XCTAssertTrue(v.isFinite && v >= 0)
+        }
+        XCTAssertEqual(e.storedBytes, 0)
+        let huge = FanoutLoadModel.estimate(LoadAssumptions(activeShares: .max, meanViewersPerShare: 1e300, motionMix: [.driving: 1],
+                                                            foregroundFraction: 0.5, copyBytes: .max, presenceTTL: .seconds(120), pushRefill: .minutes(5)))
+        XCTAssertEqual(huge.storedBytes, .max, "saturates instead of trapping in Int(Double)")
+    }
+
+    func testBudgetNeverIncreasesPushes() {
+        for refill in [Millis.seconds(1), .seconds(10), .minutes(5), .hours(1)] {
+            let a = LoadAssumptions(activeShares: 1_000, meanViewersPerShare: 3, motionMix: [.driving: 1], foregroundFraction: 0,
+                                    copyBytes: 200, presenceTTL: .seconds(120), pushRefill: refill)
+            let e = FanoutLoadModel.estimate(a)
+            XCTAssertLessThanOrEqual(e.pushesPerHourBudgeted, e.pushesPerHourUnbudgeted)
+        }
+    }
+}
+
+final class AgeRatingGateTests: XCTestCase {
+    func testAllFourCombinations() {
+        let sharing = CapabilityManifest(capabilities: [.liveLocationSharing, .locationForAppFeatures])
+        let mapsOnly = CapabilityManifest(capabilities: [.locationForAppFeatures])
+        XCTAssertEqual(AgeRatingGate.check(manifest: sharing, declaration: .init(sharedLocation: false)), [.undeclaredSharedLocation])
+        XCTAssertEqual(AgeRatingGate.check(manifest: sharing, declaration: .init(sharedLocation: true)), [])
+        XCTAssertEqual(AgeRatingGate.check(manifest: mapsOnly, declaration: .init(sharedLocation: true)), [.overDeclaredSharedLocation])
+        XCTAssertEqual(AgeRatingGate.check(manifest: mapsOnly, declaration: .init(sharedLocation: false)), [])
+        XCTAssertTrue(AgeRatingDrift.undeclaredSharedLocation.isBlocking)
+        XCTAssertFalse(AgeRatingDrift.overDeclaredSharedLocation.isBlocking)
+    }
+
+    func testDecodesTheCheckedInJSONShapes() throws {
+        let m = try CapabilityManifest.decode(Data(#"{"capabilities":["liveLocationSharing"]}"#.utf8))
+        let d = try AgeRatingDeclaration.decode(Data(#"{"sharedLocation":false}"#.utf8))
+        XCTAssertEqual(AgeRatingGate.check(manifest: m, declaration: d), [.undeclaredSharedLocation])
+        XCTAssertThrowsError(try CapabilityManifest.decode(Data(#"{"capabilities":["teleportation"]}"#.utf8)),
+                             "an unknown capability is a decode error, not silently ignored")
+    }
+}
