@@ -144,6 +144,12 @@ final class PublishPolicyTests: XCTestCase {
         XCTAssertEqual(gate.decide(fix(0.001, at: 5, accuracy: 500), now: Instant(millis: 5_000), cadence: walking), .suppress(.inaccurate))
     }
 
+    func testAPoorFirstFixIsNeverPublished() {
+        let gate = PublishGate()
+        XCTAssertEqual(gate.decide(fix(0, at: 0, accuracy: 900), now: Instant(millis: 0), cadence: walking), .suppress(.inaccurate))
+        XCTAssertEqual(gate.decide(fix(0, at: 0, accuracy: 5), now: Instant(millis: 0), cadence: walking), .publish(.first))
+    }
+
     func testHeartbeatBeatsBothBudgetAndPoorAccuracy() {
         var gate = PublishGate()
         gate.commit(fix(0, at: 0), at: Instant(millis: 0))

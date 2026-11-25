@@ -226,6 +226,44 @@ final class RelayTests: XCTestCase {
         _ = (c1, c2)
     }
 
+    func testAViewerLeftOnNoShareIsDisconnected() async throws {
+        let (relay, _) = makeRelay()
+        try await relay.startShare(s, viewers: [a], duration: .hours(1))
+        let conn = try await relay.connect(a)
+        await relay.revoke(a, from: s)
+        let live = await relay.stats.liveConnections
+        XCTAssertEqual(live, 0)
+        let control = await first(conn.control, count: 1)
+        XCTAssertEqual(control, [.revoked(s)], "the revoke is delivered first")
+        // …and then both streams actually finish (not just drop out of the stats).
+        let finished = Task { () -> Bool in
+            for await _ in conn.points {}
+            return !Task.isCancelled
+        }
+        let timer = Task { try? await Task.sleep(for: .seconds(1)); finished.cancel() }
+        let ended = await finished.value
+        timer.cancel()
+        XCTAssertTrue(ended, "the relay closed the stream")
+    }
+
+    func testRevokeAndReAddCannotResetAPushBudget() async throws {
+        let (relay, clock) = makeRelay(RelayConfiguration(pushBurst: 1, pushRefill: .minutes(5)))
+        try await relay.startShare(s, viewers: [a], duration: .hours(1))
+        _ = await relay.publish([sealedCopy("s", "a", 1)])
+        let first = await relay.drainPushes()
+        XCTAssertEqual(first.count, 1)                       // burst spent
+        await relay.revoke(a, from: s)
+        _ = await relay.drainPushes()                        // housekeeping runs while she is on no share
+        try await relay.addViewer(a, to: s)
+        clock.advance(by: .seconds(10))
+        _ = await relay.publish([sealedCopy("s", "a", 2)])
+        let second = await relay.drainPushes()
+        XCTAssertEqual(second.count, 0, "the bucket survived the revoke/re-add")
+        clock.advance(by: .minutes(5))
+        let third = await relay.drainPushes()
+        XCTAssertEqual(third.count, 1)
+    }
+
     func testDisconnectedStreamFallsBackToPush() async throws {
         let (relay, _) = makeRelay()
         try await relay.startShare(s, viewers: [a], duration: .hours(1))

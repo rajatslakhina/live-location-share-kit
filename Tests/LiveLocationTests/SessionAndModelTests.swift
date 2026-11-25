@@ -322,6 +322,84 @@ final class SharerSessionTests: XCTestCase {
         XCTAssertTrue(onShare)
     }
 
+    func testAReAddDuringASuccessfulRevokeEndsWithTheViewerOnTheRelay() async throws {
+        let (session, uplink, relay, clock) = try await setUp()
+        let carol = ViewerID("c")
+        _ = await session.ingest(fix(0, clock), conditions: walking)
+        await uplink.holdNextRevoke()
+        let revoking = Task { await session.revoke(carol) }               // parked before reaching the relay
+        while await uplink.revokeCalls < 1 { await Task.yield() }
+        try await session.addViewer(carol, publicKey: keys[2].publicKey)   // relay add is a no-op: she's still there
+        await uplink.release()                                           // …then the revoke lands and removes her
+        _ = await revoking.value
+        let onShare = await relay.viewers(of: share).contains(carol)
+        XCTAssertTrue(onShare, "the session re-sent the add after the late revoke")
+        clock.advance(by: .seconds(61))
+        _ = await session.tick(conditions: walking)
+        let latest = await relay.latest(share, for: carol)
+        XCTAssertNotNil(latest)
+    }
+
+    func testAnOfflineReAddIsQueuedAndTheStaleRevokeIsDropped() async throws {
+        let (session, uplink, relay, clock) = try await setUp()
+        let carol = ViewerID("c")
+        _ = await session.ingest(fix(0, clock), conditions: walking)
+        await uplink.setFailing(true)
+        _ = await session.revoke(carol)
+        let added = try await session.addViewer(carol, publicKey: keys[2].publicKey)
+        XCTAssertFalse(added, "not acknowledged offline")
+        let adds = await session.unacknowledgedAdds
+        let revokes = await session.unacknowledgedRevocations
+        XCTAssertEqual(adds, [carol])
+        XCTAssertEqual(revokes, [], "the intent is now 'share with Carol'")
+        await uplink.setFailing(false)
+        _ = await session.flushOutbox()
+        let addsAfter = await session.unacknowledgedAdds
+        XCTAssertEqual(addsAfter, [])
+        let onShare = await relay.viewers(of: share).contains(carol)
+        XCTAssertTrue(onShare)
+    }
+
+    func testAnOfflineAddOfANewViewerIsRetriedByFlush() async throws {
+        let (session, uplink, relay, clock) = try await setUp()
+        _ = await session.ingest(fix(0, clock), conditions: walking)
+        let dana = ViewerKeys(viewerID: ViewerID("d"))
+        await uplink.setFailing(true)
+        let added = try await session.addViewer(dana.viewerID, publicKey: dana.publicKey)
+        XCTAssertFalse(added)
+        await uplink.setFailing(false)
+        _ = await session.flushOutbox()
+        let onShare = await relay.viewers(of: share).contains(dana.viewerID)
+        XCTAssertTrue(onShare, "the queued add reached the relay")
+    }
+
+    func testAddViewerAfterStopThrows() async throws {
+        let (session, _, _, _) = try await setUp()
+        await session.stop()
+        do {
+            try await session.addViewer(ViewerID("z"), publicKey: ViewerKeys(viewerID: ViewerID("z")).publicKey)
+            XCTFail("expected shareEnded")
+        } catch {
+            XCTAssertEqual(error as? SessionError, .shareEnded)
+        }
+    }
+
+    func testClockDrivenSequencesOutrunAJunkCopyOnceTheClockPassesIt() async throws {
+        let (session, _, relay, clock) = try await setUp(startingSequence: nil)
+        _ = await session.ingest(fix(0, clock), conditions: walking)
+        let junk = SharerSession.epochSequence(clock.now().adding(.minutes(5)))
+        _ = await relay.publish([SealedPoint(shareID: share, viewerID: ViewerID("a"), sequence: junk,
+                                             sharerPublicKey: Data(repeating: 1, count: 32), ciphertext: Data([1]))])
+        clock.advance(by: .seconds(61))
+        let blocked = await session.tick(conditions: walking)
+        guard case .published(_, _, let r1) = blocked else { return XCTFail("\(blocked)") }
+        XCTAssertEqual(r1.rejected[ViewerID("a")], .staleSequence, "inside the window the junk still wins")
+        clock.advance(by: .minutes(5))
+        let unblocked = await session.tick(conditions: walking)
+        guard case .published(_, _, let r2) = unblocked else { return XCTFail("\(unblocked)") }
+        XCTAssertEqual(r2.rejected, [:], "once the clock passes the junk, genuine copies win again")
+    }
+
     func testStopDuringAFailingUploadNeverRefillsTheOutbox() async throws {
         let (session, uplink, _, clock) = try await setUp()
         _ = await session.ingest(fix(0, clock), conditions: walking)

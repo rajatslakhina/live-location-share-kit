@@ -118,7 +118,8 @@ public struct RelayStats: Sendable, Hashable {
 ///
 /// Every method is synchronous inside the actor — there is no `await` between reading and writing state,
 /// so there is no actor-reentrancy window. Storage is bounded by `maxActiveShares × maxViewersPerShare`,
-/// and connections by `maxConnectionsPerViewer` for viewers who are on at least one share.
+/// connections by `maxConnectionsPerViewer` per viewer (closed when the viewer leaves their last share),
+/// and push budgets by viewers seen within one full refill.
 /// Housekeeping: `sweep()` is O(1) until an expiry is due, then O(shares); per-viewer cleanup uses a
 /// viewer → shares index instead of scanning every share.
 public actor LocationRelay {
@@ -204,8 +205,8 @@ public actor LocationRelay {
     /// so this is defence in depth, not the only line.
     public func revoke(_ viewer: ViewerID, from share: ShareID) {
         guard shares[share]?.viewers.remove(viewer) != nil else { return }
+        send(.revoked(share), to: viewer)                // before detach: it may close the connection
         detach(viewer, from: share)
-        send(.revoked(share), to: viewer)
     }
 
     public func stopShare(_ id: ShareID) { end(id, reason: .stopped) }
@@ -295,6 +296,11 @@ public actor LocationRelay {
             pushBudgets[viewer] = bucket
             if pending[viewer]?.isEmpty == true { pending[viewer] = nil }
         }
+        // Drop budgets of viewers on no share once they have fully refilled (nothing left to protect).
+        for (viewer, var bucket) in pushBudgets where viewerShares[viewer] == nil {
+            bucket.refill(now: now)
+            if bucket.tokens == bucket.capacity { pushBudgets[viewer] = nil }
+        }
         return out
     }
 
@@ -366,14 +372,15 @@ public actor LocationRelay {
         guard let record = shares.removeValue(forKey: id) else { return }
         latest[id] = nil
         for viewer in record.viewers {
+            send(.ended(id, reason), to: viewer)           // before detach: it may close the connection
             detach(viewer, from: id)
-            send(.ended(id, reason), to: viewer)
         }
     }
 
-    /// Removes every per-(viewer, share) trace. A viewer left on no share loses their push budget entry,
-    /// which keeps `pushBudgets` bounded — and means a viewer added to a *new* share starts with a fresh
-    /// burst (documented in the README limits).
+    /// Removes every per-(viewer, share) trace. A viewer left on no share has their connections closed
+    /// (already-yielded events are still delivered). Their push budget is kept until it has fully
+    /// refilled — so revoking and re-adding cannot reset a viewer's burst — and then dropped by
+    /// `drainPushes`, which keeps `pushBudgets` bounded.
     private func detach(_ viewer: ViewerID, from share: ShareID) {
         latest[share]?[viewer] = nil
         pending[viewer]?[share] = nil
@@ -381,7 +388,9 @@ public actor LocationRelay {
         viewerShares[viewer]?.remove(share)
         if viewerShares[viewer]?.isEmpty == true {
             viewerShares[viewer] = nil
-            pushBudgets[viewer] = nil
+            if let conns = connections.removeValue(forKey: viewer) {
+                for c in conns.values { c.points.finish(); c.control.finish() }
+            }
         }
     }
 

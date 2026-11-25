@@ -113,7 +113,8 @@ public enum PublishDecision: Hashable, Sendable {
 public struct PublishGate: Sendable {
     public private(set) var lastPublished: LocationFix?
     public private(set) var lastPublishedAt: Instant?
-    /// Fixes with an accuracy radius above this are only ever sent as heartbeats.
+    /// Fixes with an accuracy radius above this are never published as movement or as the first point; a
+    /// heartbeat that falls due on one re-sends the last good fix instead (`SharerSession`).
     public let maxAccuracyMeters: Double
 
     public init(maxAccuracyMeters: Double = 200) {
@@ -124,7 +125,10 @@ public struct PublishGate: Sendable {
     /// `discretionaryAllowed` is the battery budget's answer for non-heartbeat publishes.
     public func decide(_ fix: LocationFix, now: Instant, cadence: PublishCadence,
                        discretionaryAllowed: Bool = true) -> PublishDecision {
-        guard let last = lastPublished, let lastAt = lastPublishedAt else { return .publish(.first) }
+        guard let last = lastPublished, let lastAt = lastPublishedAt else {
+            // The first point must be a good one: heartbeats later re-send it as "the last good fix".
+            return fix.accuracyMeters > maxAccuracyMeters ? .suppress(.inaccurate) : .publish(.first)
+        }
         if fix.timestamp <= last.timestamp { return .suppress(.outOfOrder) }
         let elapsed = now.elapsed(since: lastAt)
         // Heartbeat first: it is what keeps presence alive, so neither accuracy nor budget can block it.

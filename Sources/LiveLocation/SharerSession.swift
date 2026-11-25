@@ -22,6 +22,8 @@ public enum SessionError: Error, Equatable, Sendable {
     /// The app's capability manifest does not declare `.liveLocationSharing`, so the session refuses
     /// to exist. This is what ties runtime behaviour to the age-rating declaration (see `AgeRatingGate`).
     case capabilityNotDeclared
+    /// The share already ended (stopped, or gone at the relay).
+    case shareEnded
 }
 
 public enum IngestOutcome: Sendable, Hashable {
@@ -61,9 +63,11 @@ public struct SessionCounters: Sendable, Hashable {
 ///
 /// **Relaunch.** iOS kills background apps mid-share. To resume, persist `sealer.privateKeyRaw` (Keychain)
 /// and restore with `PerViewerSealer(shareID:privateKeyRaw:)`. Sequences need no persistence by default:
-/// they start at `epochSequence(now)` = wall-clock ms × 2¹⁶, so a relaunched session always starts above
+/// they follow `epochSequence(now)` = wall-clock ms × 2¹⁶, so a relaunched session always starts above
 /// everything the previous one sent (unless the device clock is set back). The app must also persist the
-/// viewer list (IDs + public keys) and `unacknowledgedRevocations`, and re-apply them after relaunch.
+/// viewer list (IDs + public keys), `unacknowledgedRevocations`, `unacknowledgedAdds` and
+/// `stopUnacknowledged`, and re-apply them after relaunch. The battery budget and the publish gate start
+/// fresh after a relaunch.
 public actor SharerSession {
     public let shareID: ShareID
     private var sealer: PerViewerSealer
@@ -78,6 +82,10 @@ public actor SharerSession {
     private var outboxSequence: UInt64 = 0
     private var outboxReason: PublishReason = .moved
     private var pendingRelayRevocations: Set<ViewerID> = []
+    private var pendingRelayAdds: Set<ViewerID> = []
+    /// Default mode: sequences follow the wall clock (see `send`). Off when the caller passes
+    /// `startingSequence`, which gives a plain counter (tests, or apps that persist sequences).
+    private let clockDrivenSequence: Bool
     private var pendingRelayStop = false
     public private(set) var isEnded = false
     public private(set) var counters = SessionCounters()
@@ -101,6 +109,7 @@ public actor SharerSession {
         self.gate = PublishGate(maxAccuracyMeters: maxAccuracyMeters)
         self.budget = TokenBucket(capacity: discretionaryBudget, refillEvery: budgetRefill, now: clock.now())
         self.nextSequence = max(1, startingSequence ?? Self.epochSequence(clock.now()))
+        self.clockDrivenSequence = startingSequence == nil
     }
 
     /// Wall-clock milliseconds × 65,536. Strictly above any sequence a previous session on the same share
@@ -122,14 +131,44 @@ public actor SharerSession {
     public var unacknowledgedRevocations: Set<ViewerID> { pendingRelayRevocations }
     /// True when `stop()` could not reach the relay yet (retried by `flushOutbox`).
     public var stopUnacknowledged: Bool { pendingRelayStop }
+    /// Viewers added locally whose relay-side add has not been acknowledged yet (retried by `flushOutbox`).
+    public var unacknowledgedAdds: Set<ViewerID> { pendingRelayAdds }
 
-    /// Adds a viewer to the running share, on the sharer's device and at the relay; the next point is
-    /// sealed for them. A revocation of the same viewer that is still pending is cancelled, so a re-added
-    /// viewer is never revoked by a stale retry.
-    public func addViewer(_ viewer: ViewerID, publicKey: Data) async throws {
+    /// Adds (or re-adds) a viewer. The key is validated first; nothing changes if it is bad. Then the next
+    /// point is sealed for them, any pending revocation of them is cancelled, and the relay is told.
+    /// Relay operations for one viewer are reconciled after every `await`, so a revoke and an add that
+    /// interleave always converge to the latest local intent.
+    /// - Returns: whether the relay acknowledged. If not, `flushOutbox` retries it (`unacknowledgedAdds`).
+    /// - Throws: `FanoutCryptoError.badViewerKey`, or `SessionError.shareEnded` after `stop()`.
+    @discardableResult
+    public func addViewer(_ viewer: ViewerID, publicKey: Data) async throws -> Bool {
+        guard !isEnded else { throw SessionError.shareEnded }
         try sealer.add(viewer, publicKey: publicKey)
         pendingRelayRevocations.remove(viewer)
-        try await uplink.addViewer(viewer, to: shareID)
+        pendingRelayAdds.insert(viewer)
+        return await syncAdd(viewer)
+    }
+
+    /// Sends a pending add and clears it only if the viewer is still a recipient afterwards.
+    private func syncAdd(_ viewer: ViewerID) async -> Bool {
+        let ok = (try? await uplink.addViewer(viewer, to: shareID)) != nil
+        if ok, sealer.recipients.contains(viewer) { pendingRelayAdds.remove(viewer) }
+        return ok
+    }
+
+    /// Sends a pending revoke and reconciles with any `addViewer` that ran during the `await`.
+    private func syncRevoke(_ viewer: ViewerID) async -> Bool {
+        let ok = (try? await uplink.revoke(viewer, from: shareID)) != nil
+        if sealer.recipients.contains(viewer) {
+            // Re-added while the revoke was in flight: the relay may have applied the revoke *after* the
+            // add, so the add is re-sent.
+            pendingRelayRevocations.remove(viewer)
+            pendingRelayAdds.insert(viewer)
+            _ = await syncAdd(viewer)
+        } else if ok {
+            pendingRelayRevocations.remove(viewer)
+        }
+        return ok
     }
 
     /// Feeds one fix from CoreLocation (or a simulator route).
@@ -173,14 +212,11 @@ public actor SharerSession {
     public func flushOutbox() async -> IngestOutcome {
         // Relay-side cleanup is retried even after the share ended: a revoke or stop that failed offline
         // must still reach the relay, or it would keep stored copies until the share expires.
-        for viewer in pendingRelayRevocations.sorted() {
-            // Skip entries cleared since the loop started (e.g. `addViewer` ran during an earlier await).
-            guard pendingRelayRevocations.contains(viewer) else { continue }
-            if (try? await uplink.revoke(viewer, from: shareID)) != nil {
-                pendingRelayRevocations.remove(viewer)
-                // Re-added while this revoke was in flight: put them back at the relay.
-                if sealer.recipients.contains(viewer) { try? await uplink.addViewer(viewer, to: shareID) }
-            }
+        for viewer in pendingRelayRevocations.sorted() where pendingRelayRevocations.contains(viewer) {
+            _ = await syncRevoke(viewer)
+        }
+        for viewer in pendingRelayAdds.sorted() where pendingRelayAdds.contains(viewer) {
+            if sealer.recipients.contains(viewer) { _ = await syncAdd(viewer) } else { pendingRelayAdds.remove(viewer) }
         }
         if pendingRelayStop, (try? await uplink.stop(shareID)) != nil { pendingRelayStop = false }
         guard !isEnded else { return .ended }
@@ -192,6 +228,7 @@ public actor SharerSession {
             let receipt = try await uplink.upload(batch)
             if outboxSequence == seq { outbox = [] }             // a newer batch may have replaced it meanwhile
             if receipt.accepted { counters.uploaded = Saturating.add(counters.uploaded, 1) }
+            guard !isEnded else { return .ended }                            // stop() ran during the upload
             if receipt.shareIsGone { endLocally(); return .ended }
             return receipt.accepted ? .published(reason, sequence: seq, receipt: receipt)
                                     : .rejected(sequence: seq, receipt: receipt)
@@ -208,15 +245,9 @@ public actor SharerSession {
     public func revoke(_ viewer: ViewerID) async -> Bool {
         sealer.revoke(viewer)
         outbox.removeAll { $0.viewerID == viewer }
-        do {
-            try await uplink.revoke(viewer, from: shareID)
-            pendingRelayRevocations.remove(viewer)
-            return true
-        } catch {
-            // Only if they were not re-added (by `addViewer`) while this call was suspended.
-            if !sealer.recipients.contains(viewer) { pendingRelayRevocations.insert(viewer) }
-            return false
-        }
+        pendingRelayAdds.remove(viewer)
+        pendingRelayRevocations.insert(viewer)
+        return await syncRevoke(viewer)
     }
 
     /// Ends the share: nothing more is sealed or uploaded, and the relay is asked to delete everything.
@@ -238,16 +269,20 @@ public actor SharerSession {
     private func endLocally() {
         isEnded = true
         outbox = []
+        pendingRelayAdds = []
     }
 
     private func send(_ payload: PointPayload, spendsBudget: Bool) async -> IngestOutcome {
-        let seq = nextSequence
+        // Clock-driven by default: the sequence never falls behind wall-clock ms × 2¹⁶, so a junk copy the
+        // relay accepted (at most `LocationRelay.maxSequenceLead` ahead) blocks this share only until the
+        // clock passes it, not for the rest of the session.
+        let seq = clockDrivenSequence ? max(nextSequence, Self.epochSequence(payload.sentAt)) : nextSequence
         let copies: [SealedPoint]
         do { copies = try sealer.sealCopies(payload, sequence: seq) } catch { return .idle }
         guard !copies.isEmpty else { return .idle }
         // Commit only once something was actually sealed: a failed seal must not reset the heartbeat clock.
         // UInt64 cannot realistically wrap (see `epochSequence`); saturate anyway.
-        nextSequence = nextSequence == .max ? .max : nextSequence + 1
+        nextSequence = seq == .max ? .max : seq + 1
         if spendsBudget { _ = budget.tryTake(now: payload.sentAt) }
         gate.commit(payload.fix, at: payload.sentAt)
         counters.sealed = Saturating.add(counters.sealed, 1)

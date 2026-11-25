@@ -11,7 +11,14 @@ print = functools.partial(print, flush=True)  # noqa: A001 — stream progress i
 import subprocess
 import sys
 
-SRC = pathlib.Path("Sources/LiveLocation")
+import shutil
+import tempfile
+
+ROOT = pathlib.Path(tempfile.mkdtemp(prefix="llk-mutants-"))
+# Work on a throwaway copy (including .build, for incremental builds) so an interrupted run can never
+# leave a mutant in the real working tree.
+shutil.copytree(".", ROOT, dirs_exist_ok=True, symlinks=True, ignore=shutil.ignore_patterns(".git"))
+SRC = ROOT / "Sources/LiveLocation"
 
 # (file, exact original text, mutant text, test filter that must fail)
 MUTANTS = [
@@ -108,13 +115,29 @@ MUTANTS = [
      "",
      "FreshnessTests/testAnOldCopyFromAnOnlineSharerIsBehindNotStale"),
     ("SharerSession.swift",
-     "if !sealer.recipients.contains(viewer) { pendingRelayRevocations.insert(viewer) }",
-     "pendingRelayRevocations.insert(viewer)",
-     "SharerSessionTests/testAViewerReAddedWhileTheirRevokeIsInFlightIsNotQueuedForRevocation"),
+     "            pendingRelayAdds.insert(viewer)\n            _ = await syncAdd(viewer)\n",
+     "",
+     "SharerSessionTests/testAReAddDuringASuccessfulRevokeEndsWithTheViewerOnTheRelay"),
     ("SharerSession.swift",
-     "        pendingRelayRevocations.remove(viewer)\n        try await uplink.addViewer(viewer, to: shareID)",
-     "        try await uplink.addViewer(viewer, to: shareID)",
-     "SharerSessionTests/testARevokeThatFailedCannotRevokeAViewerWhoWasReAdded"),
+     "            if sealer.recipients.contains(viewer) { _ = await syncAdd(viewer) } else { pendingRelayAdds.remove(viewer) }",
+     "            pendingRelayAdds.remove(viewer)",
+     "SharerSessionTests/testAnOfflineAddOfANewViewerIsRetriedByFlush"),
+    ("SharerSession.swift",
+     "let seq = clockDrivenSequence ? max(nextSequence, Self.epochSequence(payload.sentAt)) : nextSequence",
+     "let seq = nextSequence",
+     "SharerSessionTests/testClockDrivenSequencesOutrunAJunkCopyOnceTheClockPassesIt"),
+    ("PublishPolicy.swift",
+     "return fix.accuracyMeters > maxAccuracyMeters ? .suppress(.inaccurate) : .publish(.first)",
+     "return .publish(.first)",
+     "PublishPolicyTests/testAPoorFirstFixIsNeverPublished"),
+    ("LocationRelay.swift",
+     "            if bucket.tokens == bucket.capacity { pushBudgets[viewer] = nil }",
+     "            pushBudgets[viewer] = nil",
+     "RelayTests/testRevokeAndReAddCannotResetAPushBudget"),
+    ("LocationRelay.swift",
+     "                for c in conns.values { c.points.finish(); c.control.finish() }",
+     "                _ = conns",
+     "RelayTests/testAViewerLeftOnNoShareIsDisconnected"),
     ("SharerSession.swift",
      "            guard !isEnded else { return .ended }                            // never refill the outbox after stop()\n",
      "",
@@ -132,14 +155,14 @@ MUTANTS = [
 
 def compiles() -> bool:
     """A mutant that does not compile proves nothing about the tests; treat it as a setup error."""
-    r = subprocess.run(["swift", "build", "--build-tests"], capture_output=True, text=True)
+    r = subprocess.run(["swift", "build", "--build-tests"], capture_output=True, text=True, cwd=ROOT)
     return r.returncode == 0
 
 
 def run(filter_: str) -> bool:
     """True if the filtered tests pass. A hang counts as a failure (the mutant was detected)."""
     try:
-        r = subprocess.run(["swift", "test", "--filter", filter_], capture_output=True, text=True, timeout=600)
+        r = subprocess.run(["swift", "test", "--filter", filter_], capture_output=True, text=True, timeout=600, cwd=ROOT)
     except subprocess.TimeoutExpired:
         return False
     return r.returncode == 0
