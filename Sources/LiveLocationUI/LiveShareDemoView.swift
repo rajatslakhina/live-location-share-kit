@@ -73,9 +73,11 @@ struct RefusedCard: View {
     let model: ScenarioModel
     var body: some View {
         Card(title: "No share ran") {
-            Text(model.timeline.last?.text ?? "The session was refused.").font(.callout)
-            Text("The app fails closed: without liveLocationSharing in its capability manifest, SharerSession refuses to start.")
-                .font(.footnote).foregroundStyle(.secondary)
+            Text(model.timeline.last?.text ?? "The scenario could not start.").font(.callout)
+            if model.refusedByManifest {
+                Text("The app fails closed: without liveLocationSharing in its capability manifest, SharerSession refuses to start.")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
         }
     }
 }
@@ -117,7 +119,7 @@ struct SharerTab: View {
                                 Metric(value: "\(c.uploaded)", label: "points sent")
                                 Metric(value: "\(c.heartbeats)", label: "heartbeats")
                             }
-                            Text("Points reached the relay as one sealed copy per viewer. A naive 1 Hz publisher would have sent \(ScenarioModel.scenarioMinutes * 60).")
+                            Text("\(c.uploaded - model.timerHeartbeats) points came from GPS fixes and \(model.timerHeartbeats) are heartbeats sent while parked; each reached the relay as one sealed copy per viewer. A naive 1 Hz publisher would have sent \(ScenarioModel.scenarioMinutes * 60).")
                                 .font(.footnote).foregroundStyle(.secondary)
                         }
                         Card(title: "Why fixes were not sent") {

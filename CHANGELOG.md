@@ -1,9 +1,14 @@
 # Changelog
 
-All tags were published on 25 Nov 2026, and each was checked by an independent review before the next. Use the latest.
+All tags were published on 25 Nov 2026. Six independent review rounds drove the fixes. Use the latest.
+
+## 2.1.2
+- **Single-flight relay calls per viewer.** These replace the 2.1.1 generation-and-resend logic, which could ping-pong forever when two calls for one viewer overlapped (for example `revoke` plus the flush timer). At most one relay call per viewer is now in flight. When it returns, the session sends the latest intent, and stops once that intent has been acknowledged. A stale refusal no longer removes a re-added viewer.
+- **Load model.** Overflowing inputs now clamp high instead of reading as zero load.
+- **Demo.** The Sharer card shows the split of 37 points into 32 from fixes and 5 parked heartbeats. Only a manifest refusal is blamed on the manifest.
 
 ## 2.1.1
-- **Relay reconciliation.** Revokes and adds for one viewer carry a generation number, so a slow reply to an older call can no longer clear a newer pending operation. Instead, the session re-sends the current intent.
+- **Relay reconciliation (superseded in 2.1.2).** Per-viewer generation numbers re-sent the current intent after a stale reply.
 - **Permanent relay refusals.** `tooManyViewers` and `unknownShare` responses to `addViewer` are treated as final and are not retried.
 - **`flushOutbox` after `stop()`.** It returns `.ended` if `stop()` ran during its upload, whether that upload succeeded or failed.
 - **Demo.** A refused session is shown as such instead of "Preparing…".
@@ -37,4 +42,4 @@ Re-releases the source-breaking fixes first tagged as 1.0.1–1.0.5 under a majo
 - **1.0.2–1.0.5.** Demo UI polish, plus removal of a redundant outbox filter that was masking a mutant.
 
 ## 1.0.0
-Initial release. Superseded: use 2.1.1 or later.
+Initial release. Superseded: use 2.1.2 or later.

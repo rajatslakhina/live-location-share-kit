@@ -97,5 +97,6 @@ public enum FanoutLoadModel {
                             backgroundViewers: finite(backgroundViewers))
     }
 
-    private static func finite(_ d: Double) -> Double { d.isFinite ? d : 0 }
+    /// NaN → 0; ±∞ clamps to the largest finite value, so an overflowing input never reads as "no load".
+    private static func finite(_ d: Double) -> Double { d.isNaN ? 0 : min(max(d, 0), .greatestFiniteMagnitude) }
 }

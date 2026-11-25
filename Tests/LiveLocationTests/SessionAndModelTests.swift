@@ -206,7 +206,9 @@ final class SharerSessionTests: XCTestCase {
         XCTAssertLessThan(SharerSession.epochSequence(Instant(millis: 1_000)), SharerSession.epochSequence(Instant(millis: 1_001)))
         XCTAssertEqual(SharerSession.epochSequence(Instant(millis: -5)), 0)
         XCTAssertEqual(SharerSession.epochSequence(Instant(millis: .max)), UInt64.max, "saturates, never wraps backwards")
-        XCTAssertLessThanOrEqual(SharerSession.epochSequence(Instant(millis: 1 << 47)), SharerSession.epochSequence(Instant(millis: 1 << 50)))
+        XCTAssertEqual(SharerSession.epochSequence(Instant(millis: 1 << 47)), 1 << 63)
+        XCTAssertLessThan(SharerSession.epochSequence(Instant(millis: (1 << 48) - 1)), .max)
+        XCTAssertEqual(SharerSession.epochSequence(Instant(millis: 1 << 48)), .max, "the first value that would overflow saturates")
     }
 
     func testSessionStopsWhenTheRelayHasForgottenTheShare() async throws {
@@ -519,6 +521,28 @@ final class SharerSessionTests: XCTestCase {
         }
     }
 
+    func testRelayCallsForOneViewerAreSingleFlight() async throws {
+        let (session, uplink, relay, clock) = try await setUp()
+        let carol = ViewerID("c")
+        _ = await session.ingest(fix(0, clock), conditions: walking)
+        await uplink.holdNextRevoke()
+        let first = Task { await session.revoke(carol) }                 // in flight, parked
+        while await uplink.revokeCalls < 1 { await Task.yield() }
+        let second = await session.revoke(carol)                         // a double tap…
+        let flushed = await session.flushOutbox()                        // …and the 1 s timer, meanwhile
+        XCTAssertFalse(second, "pending: another call for Carol is in flight")
+        _ = flushed
+        await uplink.release()
+        let firstResult = await first.value
+        XCTAssertTrue(firstResult)
+        let calls = await uplink.revokeCalls
+        XCTAssertEqual(calls, 1, "one relay call, not one per caller — and no ping-pong")
+        let onShare = await relay.viewers(of: share).contains(carol)
+        XCTAssertFalse(onShare)
+        let pending = await session.unacknowledgedRevocations
+        XCTAssertEqual(pending, [])
+    }
+
     func testStopDuringAFailingUploadNeverRefillsTheOutbox() async throws {
         let (session, uplink, _, clock) = try await setUp()
         _ = await session.ingest(fix(0, clock), conditions: walking)
@@ -723,6 +747,7 @@ final class LoadModelTests: XCTestCase {
         let huge = FanoutLoadModel.estimate(LoadAssumptions(activeShares: .max, meanViewersPerShare: 1e300, motionMix: [.driving: 1],
                                                             foregroundFraction: 0.5, copyBytes: .max, presenceTTL: .seconds(120), pushRefill: .minutes(5)))
         XCTAssertEqual(huge.storedBytes, .max, "saturates instead of trapping in Int(Double)")
+        XCTAssertGreaterThan(huge.copiesPerSecond, 0, "an overflowing estimate clamps high, never reads as zero load")
     }
 
     func testABudgetLooserThanThePublishRateChangesNothing() {

@@ -75,6 +75,11 @@ public final class ScenarioModel {
     public private(set) var copyBytes = 0
     public private(set) var flushedAfterOutage = false
     public private(set) var refusal = ""
+    /// Heartbeats sent by the timer while parked (no new GPS fix): the gap between "fixes that were
+    /// published" and "points sent".
+    public private(set) var timerHeartbeats = 0
+    /// True when the session itself refused to start because the manifest lacks the capability.
+    public private(set) var refusedByManifest = false
 
     private let clock = ManualClock(start: Instant(millis: 1_764_000_000_000))
     /// Random, so the relay learns nothing from the identifier itself.
@@ -128,6 +133,7 @@ public final class ScenarioModel {
             session = try SharerSession(shareID: shareID, manifest: manifest, sealer: sealer, uplink: uplink,
                                         clock: clock, discretionaryBudget: Self.demoBudget, budgetRefill: .seconds(60))
         } catch {
+            refusedByManifest = (error as? SessionError) == .capabilityNotDeclared
             log(0, "Session refused: \(error)")
             return
         }
@@ -178,6 +184,10 @@ public final class ScenarioModel {
             let outcome: IngestOutcome
             if motion == .stationary {
                 outcome = await session.tick(conditions: conditions)
+                switch outcome {
+                case .published, .heldOffline: timerHeartbeats += 1     // a held one is flushed at 09:00
+                default: break
+                }
             } else if second == Self.reorderedFixSecond,
                       let stale = LocationFix(latitude: lat - 0.0005, longitude: lon, accuracyMeters: 8,
                                               timestamp: Instant(millis: clock.now().millis - 45_000)) {

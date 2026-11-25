@@ -14,6 +14,7 @@ final class ScenarioModelTests: XCTestCase {
         XCTAssertEqual(c.fixesSeen, ScenarioExpectations.fixes)
         XCTAssertEqual(c.uploaded, ScenarioExpectations.uploaded)
         XCTAssertEqual(c.heartbeats, ScenarioExpectations.heartbeats)
+        XCTAssertEqual(model.timerHeartbeats, ScenarioExpectations.parkedHeartbeats, "37 points = 32 from fixes + 5 parked heartbeats")
         XCTAssertEqual(c.suppressed[.inaccurate], 1)
         XCTAssertEqual(c.suppressed[.outOfOrder], 1)
         XCTAssertGreaterThan(c.suppressed[.budgetExhausted] ?? 0, 0, "the demo budget must visibly run dry")
@@ -43,6 +44,7 @@ final class RefusedScenarioTests: XCTestCase {
                                   declaration: AgeRatingDeclaration(sharedLocation: false))
         await model.runIfNeeded()
         XCTAssertTrue(model.ranNoShare)
+        XCTAssertTrue(model.refusedByManifest)
         XCTAssertTrue(model.timeline.last?.text.contains("capabilityNotDeclared") ?? false)
     }
 }
@@ -52,6 +54,7 @@ enum ScenarioExpectations {
     static let fixes = 420
     static let uploaded = 37
     static let heartbeats = 6
+    static let parkedHeartbeats = 5
     static let copyBytes = 365
     static let bobDecrypted = 5
     static let carolDecrypted = 29
