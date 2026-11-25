@@ -56,6 +56,17 @@ struct Metric: View {
     }
 }
 
+extension View {
+    /// Compact titles on iOS so each tab's content fits above the floating tab bar.
+    func compactTitle(_ title: String) -> some View {
+        #if os(iOS)
+        return navigationTitle(title).navigationBarTitleDisplayMode(.inline)
+        #else
+        return navigationTitle(title)
+        #endif
+    }
+}
+
 struct RunningPlaceholder: View {
     let running: Bool
     var body: some View {
@@ -108,19 +119,23 @@ struct SharerTab: View {
                             }
                         }
                         Card(title: "Timeline") {
-                            ForEach(model.timeline) { e in
-                                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                                    Text(e.minute).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-                                    Text(e.text).font(.caption)
+                            DisclosureGroup("\(model.timeline.count) events") {
+                                ForEach(model.timeline) { e in
+                                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                        Text(e.minute).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                                        Text(e.text).font(.caption)
+                                        Spacer(minLength: 0)
+                                    }
                                 }
                             }
+                            .font(.subheadline)
                         }
                     }
                 }
                 .padding()
                 .padding(.bottom, 72)   // keep the last card clear of the floating tab bar
             }
-            .navigationTitle("Sharing")
+            .compactTitle("Sharing")
         }
     }
 }
@@ -162,7 +177,7 @@ struct ViewersTab: View {
                 .padding()
                 .padding(.bottom, 72)   // keep the last card clear of the floating tab bar
             }
-            .navigationTitle("Viewers")
+            .compactTitle("Viewers")
         }
     }
 
@@ -182,24 +197,26 @@ struct ViewersTab: View {
             MapPolyline(coordinates: model.route.map { CLLocationCoordinate2D(latitude: $0.latitude, longitude: $0.longitude) })
                 .stroke(.blue.opacity(0.5), lineWidth: 4)
             ForEach(groups.indices, id: \.self) { i in
-                Marker("\(groups[i].names.joined(separator: ", ")) see", coordinate: groups[i].coordinate)
+                Marker("\(groups[i].names.joined(separator: " & ")) \(groups[i].names.count == 1 ? "sees" : "see")", coordinate: groups[i].coordinate)
                     .tint(i == 0 ? .green : .orange)
             }
         }
-        .frame(height: 220)
+        .frame(height: 210)
         .clipShape(RoundedRectangle(cornerRadius: 14))
     }
 
     private func viewerCard(_ v: ViewerRow) -> some View {
-        Card(title: v.name) {
-            HStack {
-                Circle().fill(color(v.freshness)).frame(width: 10, height: 10)
-                Text(v.freshness.label).font(.headline)
-                Spacer()
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            Circle().fill(color(v.freshness)).frame(width: 10, height: 10)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("\(v.name) · \(v.freshness.label)").font(.headline)
+                Text("\(v.channel.rawValue) · \(v.received) decrypted\(v.rejected > 0 ? " · \(v.rejected) rejected" : "")")
+                    .font(.footnote).foregroundStyle(.secondary)
             }
-            Text("\(v.channel.rawValue) · \(v.received) decrypted\(v.rejected > 0 ? " · \(v.rejected) rejected" : "")")
-                .font(.footnote).foregroundStyle(.secondary)
+            Spacer(minLength: 0)
         }
+        .padding(12)
+        .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 14))
     }
 
     private func color(_ f: Freshness) -> Color {
@@ -230,7 +247,7 @@ struct CapacityTab: View {
                 .padding()
                 .padding(.bottom, 72)
             }
-            .navigationTitle("Capacity")
+            .compactTitle("Capacity")
         }
     }
 
@@ -258,14 +275,17 @@ struct CapacityTab: View {
                 .font(.footnote).foregroundStyle(.secondary)
         }
         Card(title: "Storage (latest copy only)") {
-            Metric(value: "\((e.storedBytes / 1_000).formatted()) kB", label: "for 3,000 (share, viewer) pairs")
+            Metric(value: "\((e.storedBytes / 1_000).formatted(.number.locale(Self.numbers))) kB", label: "for 3,000 (share, viewer) pairs")
             Text("Copy size \(model.copyBytes) bytes, measured from the scenario's real sealed copy (plaintext padded to a fixed size). Assumes a commuting-hour mix: 55 % parked, 20 % walking, 5 % cycling, 20 % driving; 30 % of viewers in the foreground.")
                 .font(.footnote).foregroundStyle(.secondary)
         }
     }
 
+    /// Fixed grouping (1,234,567) whatever the device region, so the numbers match the README.
+    static let numbers = Locale(identifier: "en_US_POSIX")
+
     private func fmt(_ d: Double) -> String {
-        d >= 100 ? Saturating.int(d.rounded()).formatted(.number.grouping(.automatic)) : String(format: "%.1f", d)
+        d >= 100 ? Saturating.int(d.rounded()).formatted(.number.locale(Self.numbers)) : String(format: "%.1f", d)
     }
 }
 
@@ -310,7 +330,7 @@ struct GateTab: View {
                 .padding()
                 .padding(.bottom, 72)
             }
-            .navigationTitle("Age rating")
+            .compactTitle("Age rating")
         }
     }
 }
