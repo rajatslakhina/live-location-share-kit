@@ -139,8 +139,22 @@ final class RelayTests: XCTestCase {
         XCTAssertEqual(control, [.revoked(s)])
         let pushes = await relay.drainPushes()
         XCTAssertEqual(pushes, [])
-        let budgets = await relay.stats.pushBudgets
-        XCTAssertEqual(budgets, 0, "viewers on no share keep no budget entry")
+    }
+
+    func testABudgetOfAViewerOnNoShareIsKeptUntilFullThenDropped() async throws {
+        let (relay, clock) = makeRelay(RelayConfiguration(pushBurst: 1, pushRefill: .minutes(5)))
+        try await relay.startShare(s, viewers: [a], duration: .hours(1))
+        _ = await relay.publish([sealedCopy("s", "a", 1)])
+        let sent = await relay.drainPushes()
+        XCTAssertEqual(sent.count, 1)                          // the bucket now exists, and is empty
+        await relay.revoke(a, from: s)
+        _ = await relay.drainPushes()
+        let whileRefilling = await relay.stats.pushBudgets
+        XCTAssertEqual(whileRefilling, 1, "a spent budget is kept while she is on no share")
+        clock.advance(by: .minutes(5))
+        _ = await relay.drainPushes()
+        let afterRefill = await relay.stats.pushBudgets
+        XCTAssertEqual(afterRefill, 0, "once full it protects nothing, so it is dropped")
     }
 
     func testPresenceGoesAwayAfterTTL() async throws {

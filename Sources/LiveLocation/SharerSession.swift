@@ -2,6 +2,11 @@ import Foundation
 
 /// The sharer's path to the relay. `LocationRelay` conforms directly (in-process, as in the demo);
 /// a production client would implement it over HTTPS.
+///
+/// **Error contract.** `revoke` and `stop` must be idempotent: for a share or viewer the relay no longer
+/// knows, either succeed or throw `RelayError.unknownShare` (an HTTPS client maps its 404 to that); the
+/// session treats both as acknowledged. `addViewer` reports a refusal as a `RelayError`. Any other error
+/// is treated as a transport failure: the call stays pending and `flushOutbox` retries it.
 public protocol RelayUplink: Sendable {
     /// The relay's presence TTL. The session reads its heartbeat interval from here, so the two can never
     /// disagree.
@@ -31,7 +36,8 @@ public enum IngestOutcome: Sendable, Hashable {
     case suppressed(SuppressReason)
     /// Sealed and uploaded, but the relay accepted no copy (all stale, not a recipient, or future).
     case rejected(sequence: UInt64, receipt: PublishReceipt)
-    /// Sealed, but the uplink failed; kept in a one-slot, latest-wins outbox.
+    /// Sealed, but the uplink failed. The outbox holds one batch, latest wins: this one is kept unless a
+    /// newer batch is already held, which then supersedes it (location is latest-only anyway).
     case heldOffline(sequence: UInt64)
     /// Nothing to send (no recipients left, or no prior fix to heartbeat).
     case idle
@@ -48,6 +54,7 @@ public struct SessionCounters: Sendable, Hashable {
     public internal(set) var uploaded = 0
     public internal(set) var heartbeats = 0
     public internal(set) var suppressed: [SuppressReason: Int] = [:]
+    /// Batches whose upload failed (each returned `.heldOffline`; only the newest is kept).
     public internal(set) var heldOffline = 0
     public init() {}
 }
@@ -66,7 +73,7 @@ public struct SessionCounters: Sendable, Hashable {
 /// they follow `epochSequence(now)` = wall-clock ms × 2¹⁶, so a relaunched session always starts above
 /// everything the previous one sent (unless the device clock is set back). The app must also persist the
 /// viewer list (IDs + public keys), `unacknowledgedRevocations`, `unacknowledgedAdds` and
-/// `stopUnacknowledged`, and re-apply them after relaunch. The battery budget and the publish gate start
+/// `stopUnacknowledged`, re-apply them after relaunch, and check `refusedAdds` after each `flushOutbox`. The battery budget and the publish gate start
 /// fresh after a relaunch.
 public actor SharerSession {
     public let shareID: ShareID
@@ -81,15 +88,23 @@ public actor SharerSession {
     private var outbox: [SealedPoint] = []
     private var outboxSequence: UInt64 = 0
     private var outboxReason: PublishReason = .moved
-    /// Pending relay intents only: `true` = should be on the share, `false` = should be revoked.
-    /// Entries are removed once the relay acknowledges, so this holds only unfinished work.
-    private var desiredOnRelay: [ViewerID: Bool] = [:]
+    /// One relay intent for a viewer. `epoch` is unique per `addViewer`/`revoke` call, so a refusal can be
+    /// matched to the exact intent it answers, not merely to an equal-looking later one.
+    private struct Intent: Equatable { let onShare: Bool; let epoch: UInt64 }
+    /// Pending relay intents only. Entries are removed once the relay acknowledges (or finally refuses),
+    /// so this holds only unfinished work.
+    private var desiredOnRelay: [ViewerID: Intent] = [:]
+    private var intentEpoch: UInt64 = 0
     private var reconciling: Set<ViewerID> = []
     /// Default mode: sequences follow the wall clock (see `send`). Off when the caller passes
     /// `startingSequence`, which gives a plain counter (tests, or apps that persist sequences).
     private let clockDrivenSequence: Bool
     private var pendingRelayStop = false
     public private(set) var isEnded = false
+    /// Adds the relay finally refused, with its reason. A refused viewer is also removed locally. Filled
+    /// whichever call met the refusal — including a `flushOutbox` retry, which has no caller to throw to —
+    /// and cleared for a viewer when `addViewer` is called for them again.
+    public private(set) var refusedAdds: [ViewerID: RelayError] = [:]
     public private(set) var counters = SessionCounters()
     public private(set) var lastCadence: PublishCadence?
 
@@ -130,11 +145,11 @@ public actor SharerSession {
     /// Who the held offline batch is addressed to (empty when nothing is held).
     public var heldBatchRecipients: [ViewerID] { outbox.map(\.viewerID) }
     /// Viewers whose relay-side revocation has not been acknowledged yet (retried by `flushOutbox`).
-    public var unacknowledgedRevocations: Set<ViewerID> { Set(desiredOnRelay.filter { !$0.value }.keys) }
+    public var unacknowledgedRevocations: Set<ViewerID> { Set(desiredOnRelay.filter { !$0.value.onShare }.keys) }
     /// True when `stop()` could not reach the relay yet (retried by `flushOutbox`).
     public var stopUnacknowledged: Bool { pendingRelayStop }
     /// Viewers added locally whose relay-side add has not been acknowledged yet (retried by `flushOutbox`).
-    public var unacknowledgedAdds: Set<ViewerID> { Set(desiredOnRelay.filter { $0.value }.keys) }
+    public var unacknowledgedAdds: Set<ViewerID> { Set(desiredOnRelay.filter { $0.value.onShare }.keys) }
 
     /// Adds (or re-adds) a viewer. The key is validated first; nothing changes if it is bad. Then the next
     /// point is sealed for them and the relay is told.
@@ -143,42 +158,59 @@ public actor SharerSession {
     /// session sends whatever the latest local intent is by then (on the share, or not), until the relay has
     /// acknowledged the latest intent. Calls made meanwhile only update the intent.
     /// - Returns: whether the relay has acknowledged the latest intent for this viewer. `false` means it is
-    ///   pending (offline, or another call for this viewer is still in flight); `flushOutbox` finishes it.
-    /// - Throws: `FanoutCryptoError.badViewerKey`; `SessionError.shareEnded` after `stop()` or if the relay
-    ///   no longer knows the share; `RelayError.tooManyViewers` (the viewer is then removed locally too).
+    ///   still pending (offline, or another call for this viewer is in flight); `flushOutbox` finishes it,
+    ///   and a refusal met then is reported in `refusedAdds`.
+    /// - Throws: `FanoutCryptoError.badViewerKey`; `SessionError.shareEnded` if the share ended before or
+    ///   during the call (after `stop()`, or the relay no longer knows the share); `RelayError.tooManyViewers`
+    ///   if the relay refused (the viewer is then removed locally too).
     @discardableResult
     public func addViewer(_ viewer: ViewerID, publicKey: Data) async throws -> Bool {
         guard !isEnded else { throw SessionError.shareEnded }
         try sealer.add(viewer, publicKey: publicKey)
-        desiredOnRelay[viewer] = true
-        return try await reconcile(viewer)
+        refusedAdds[viewer] = nil
+        setIntent(viewer, onShare: true)
+        let acknowledged = try await reconcile(viewer)
+        if isEnded { throw SessionError.shareEnded }                // stop() ran while the add was in flight
+        return acknowledged
+    }
+
+    private func setIntent(_ viewer: ViewerID, onShare: Bool) {
+        intentEpoch = Saturating.add(intentEpoch, 1)
+        desiredOnRelay[viewer] = Intent(onShare: onShare, epoch: intentEpoch)
     }
 
     /// Drives the relay towards `desiredOnRelay[viewer]`, one call at a time. Terminates: it only loops when
     /// the intent changed during the previous call, and each change needs a new `revoke`/`addViewer`.
+    /// - Returns: `true` only when the relay acknowledged the latest intent; `false` when it is still
+    ///   pending, or was dropped because the share ended.
     private func reconcile(_ viewer: ViewerID) async throws -> Bool {
         guard !reconciling.contains(viewer) else { return false }   // the in-flight call will pick up the intent
         reconciling.insert(viewer)
         defer { reconciling.remove(viewer) }
-        while let want = desiredOnRelay[viewer] {
-            if want && isEnded { desiredOnRelay[viewer] = nil; return false }
+        while let sent = desiredOnRelay[viewer] {
+            if sent.onShare && isEnded { desiredOnRelay[viewer] = nil; return false }
             do {
-                if want { try await uplink.addViewer(viewer, to: shareID) }
+                if sent.onShare { try await uplink.addViewer(viewer, to: shareID) }
                 else { try await uplink.revoke(viewer, from: shareID) }
-            } catch let refusal as RelayError where want {
-                guard desiredOnRelay[viewer] == true else { continue }   // stale refusal: send the new intent
-                // The relay answered "no" to the latest intent: retrying cannot help.
+            } catch let refusal as RelayError where sent.onShare {
+                // A refusal is final only if it answers the exact latest intent; otherwise send the new one.
+                guard desiredOnRelay[viewer]?.epoch == sent.epoch else { continue }
                 desiredOnRelay[viewer] = nil
                 if refusal == .unknownShare { endLocally(); throw SessionError.shareEnded }
                 sealer.revoke(viewer)
+                outbox.removeAll { $0.viewerID == viewer }
+                refusedAdds[viewer] = refusal
                 throw refusal
+            } catch RelayError.unknownShare where !sent.onShare {
+                // The relay no longer knows the share, so the viewer is not on it: that is the revoke done.
             } catch {
                 return false                                    // transport failure: stays pending
             }
-            if desiredOnRelay[viewer] == want { desiredOnRelay[viewer] = nil; return true }
-            // The intent changed while the call was in flight: loop and send the new one.
+            // Calls are serial, so after an acknowledged call the relay holds `sent.onShare`. If the latest
+            // intent wants the same, it is satisfied too; if it changed (or the share ended), loop on what is left.
+            if desiredOnRelay[viewer]?.onShare == sent.onShare { desiredOnRelay[viewer] = nil; return true }
         }
-        return true
+        return false
     }
 
     /// Feeds one fix from CoreLocation (or a simulator route).
@@ -218,12 +250,13 @@ public actor SharerSession {
     }
 
     /// Retries pending relay revocations, adds and stop, then the held batch, if any. Location is
-    /// latest-wins, so only the newest batch is ever kept.
+    /// latest-wins, so only the newest batch is ever kept. An add the relay refuses here is dropped and
+    /// reported in `refusedAdds`.
     public func flushOutbox() async -> IngestOutcome {
         // Relay-side cleanup is retried even after the share ended: a revoke or stop that failed offline
         // must still reach the relay, or it would keep stored copies until the share expires.
         for viewer in desiredOnRelay.keys.sorted() { _ = try? await reconcile(viewer) }
-        if pendingRelayStop, (try? await uplink.stop(shareID)) != nil { pendingRelayStop = false }
+        if pendingRelayStop, await stopAtRelay() { pendingRelayStop = false }
         guard !isEnded else { return .ended }
         // The outbox never holds a copy for a revoked viewer: `send` filters on the way in and `revoke`
         // removes on the way out, so it can be uploaded as is.
@@ -251,7 +284,7 @@ public actor SharerSession {
     public func revoke(_ viewer: ViewerID) async -> Bool {
         sealer.revoke(viewer)
         outbox.removeAll { $0.viewerID == viewer }
-        desiredOnRelay[viewer] = false
+        setIntent(viewer, onShare: false)
         return (try? await reconcile(viewer)) ?? false
     }
 
@@ -260,14 +293,16 @@ public actor SharerSession {
     @discardableResult
     public func stop() async -> Bool {
         endLocally()
-        do {
-            try await uplink.stop(shareID)
-            pendingRelayStop = false
-            return true
-        } catch {
-            pendingRelayStop = true
-            return false
-        }
+        let acknowledged = await stopAtRelay()
+        pendingRelayStop = !acknowledged
+        return acknowledged
+    }
+
+    /// `unknownShare` counts as acknowledged: a share the relay has forgotten is already stopped.
+    private func stopAtRelay() async -> Bool {
+        do { try await uplink.stop(shareID); return true }
+        catch RelayError.unknownShare { return true }
+        catch { return false }
     }
 
     /// Local end: drop the outbox and pending adds. Pending revocations are kept so `flushOutbox` can still
@@ -275,7 +310,7 @@ public actor SharerSession {
     private func endLocally() {
         isEnded = true
         outbox = []
-        desiredOnRelay = desiredOnRelay.filter { !$0.value }
+        desiredOnRelay = desiredOnRelay.filter { !$0.value.onShare }
     }
 
     private func send(_ payload: PointPayload, spendsBudget: Bool) async -> IngestOutcome {
@@ -309,6 +344,7 @@ public actor SharerSession {
                 outbox = copies.filter { current.contains($0.viewerID) }
                 outboxSequence = seq
                 outboxReason = payload.reason
+                if outbox.isEmpty { return .idle }               // everyone it was for was revoked meanwhile
             }
             counters.heldOffline = Saturating.add(counters.heldOffline, 1)
             return .heldOffline(sequence: seq)

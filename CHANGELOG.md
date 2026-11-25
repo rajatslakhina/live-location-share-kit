@@ -1,9 +1,17 @@
 # Changelog
 
-All tags were published on 25 Nov 2026. Six independent review rounds drove the fixes. Use the latest.
+All tags were published on 25 Nov 2026. Seven independent review rounds drove the fixes. Use the latest.
+
+## 2.1.3
+- **Relay refusals are matched to the exact intent they answer.** Each `addViewer`/`revoke` gets its own intent epoch. In 2.1.2 a late refusal of an older add could still drop a viewer who had been revoked and re-added in the meantime, because the check compared intent values, not identity. Now only a refusal of the latest intent is final.
+- **New `refusedAdds`.** An add that the relay refuses during a `flushOutbox` retry (with no caller to throw to) is reported there.
+- **`addViewer` throws `shareEnded`** if `stop()` ran while the add was in flight, instead of returning `true`.
+- **`revoke` and `stop` treat `RelayError.unknownShare` as done,** so a relay that has forgotten an expired share no longer makes the 1 s timer retry forever. `RelayUplink` now documents this error contract.
+- **`.heldOffline` documentation** now says a batch is superseded when a newer one is already held, and a failed batch for viewers who were all revoked meanwhile returns `.idle`.
+- **Tests.** Five new tests and five new mutants (41 in all), including a non-vacuous check that a viewer's push budget is dropped once it refills.
 
 ## 2.1.2
-- **Single-flight relay calls per viewer.** These replace the 2.1.1 generation-and-resend logic, which could ping-pong forever when two calls for one viewer overlapped (for example `revoke` plus the flush timer). At most one relay call per viewer is now in flight. When it returns, the session sends the latest intent, and stops once that intent has been acknowledged. A stale refusal no longer removes a re-added viewer.
+- **Single-flight relay calls per viewer.** These replace the 2.1.1 generation-and-resend logic, which could ping-pong forever when two calls for one viewer overlapped (for example `revoke` plus the flush timer). At most one relay call per viewer is now in flight. When it returns, the session sends the latest intent, and stops once that intent has been acknowledged. A stale refusal was meant to no longer remove a re-added viewer, but the check was incomplete (fixed in 2.1.3).
 - **Load model.** Overflowing inputs now clamp high instead of reading as zero load.
 - **Demo.** The Sharer card shows the split of 37 points into 32 from fixes and 5 parked heartbeats. Only a manifest refusal is blamed on the manifest.
 

@@ -15,6 +15,8 @@ actor GatedUplink: RelayUplink {
     private var parked: [CheckedContinuation<Void, Never>] = []
     private(set) var uploads: [[SealedPoint]] = []
     var failing = false
+    /// Answer `revoke` and `stop` with `RelayError.unknownShare`, as an HTTPS relay would for an expired share.
+    var unknownShareOnCleanup = false
 
     init(relay: LocationRelay) { self.relay = relay }
     func holdNextUpload() { holdNext = true }
@@ -24,6 +26,7 @@ actor GatedUplink: RelayUplink {
     /// Park the next add *after* the relay applied it: a slow reply.
     func holdAfterNextAdd() { holdAfterNextAddCall = true }
     func setFailing(_ f: Bool) { failing = f }
+    func setUnknownShareOnCleanup(_ u: Bool) { unknownShareOnCleanup = u }
     func release() { parked.forEach { $0.resume() }; parked = [] }
 
     func upload(_ copies: [SealedPoint]) async throws -> PublishReceipt {
@@ -43,6 +46,7 @@ actor GatedUplink: RelayUplink {
             await withCheckedContinuation { parked.append($0) }
         }
         if failing { throw URLError(.notConnectedToInternet) }
+        if unknownShareOnCleanup { throw RelayError.unknownShare }
         await relay.revoke(viewer, from: share)
         if holdAfterNextRevokeCall {
             holdAfterNextRevokeCall = false
@@ -52,12 +56,21 @@ actor GatedUplink: RelayUplink {
 
     func stop(_ share: ShareID) async throws {
         if failing { throw URLError(.notConnectedToInternet) }
+        if unknownShareOnCleanup { throw RelayError.unknownShare }
         await relay.stopShare(share)
     }
 
     func addViewer(_ viewer: ViewerID, to share: ShareID) async throws {
         if failing { throw URLError(.notConnectedToInternet) }
-        try await relay.addViewer(viewer, to: share)
+        do {
+            try await relay.addViewer(viewer, to: share)
+        } catch {
+            if holdAfterNextAddCall {                                   // a slow refusal
+                holdAfterNextAddCall = false
+                await withCheckedContinuation { parked.append($0) }
+            }
+            throw error
+        }
         if holdAfterNextAddCall {
             holdAfterNextAddCall = false
             await withCheckedContinuation { parked.append($0) }
@@ -349,7 +362,7 @@ final class SharerSessionTests: XCTestCase {
         await uplink.holdNextRevoke()
         let revoking = Task { await session.revoke(carol) }               // parked before reaching the relay
         while await uplink.revokeCalls < 1 { await Task.yield() }
-        try await session.addViewer(carol, publicKey: keys[2].publicKey)   // relay add is a no-op: she's still there
+        try await session.addViewer(carol, publicKey: keys[2].publicKey)   // parks: the in-flight revoke's reconciler sends the add afterwards
         await uplink.release()                                           // …then the revoke lands and removes her
         _ = await revoking.value
         let onShare = await relay.viewers(of: share).contains(carol)
@@ -478,6 +491,88 @@ final class SharerSessionTests: XCTestCase {
         XCTAssertFalse(recipients.contains(extra.viewerID), "not sealed for a viewer the relay refused")
         let pending = await session.unacknowledgedAdds
         XCTAssertEqual(pending, [], "and not retried forever")
+    }
+
+    /// A session on a relay that holds at most three viewers, behind a `GatedUplink`.
+    func setUpFullShare() async throws -> (SharerSession, GatedUplink, LocationRelay, ManualClock) {
+        let clock = ManualClock(start: Instant(millis: 1_000_000))
+        let relay = LocationRelay(configuration: RelayConfiguration(maxViewersPerShare: 3), clock: clock)
+        try await relay.startShare(share, viewers: Set(keys.map(\.viewerID)), duration: .hours(1))
+        var sealer = PerViewerSealer(shareID: share)
+        for k in keys { try sealer.add(k.viewerID, publicKey: k.publicKey) }
+        let uplink = GatedUplink(relay: relay)
+        let session = try SharerSession(shareID: share, manifest: manifest, sealer: sealer, uplink: uplink, clock: clock)
+        return (session, uplink, relay, clock)
+    }
+
+    func testAStaleRefusalCannotDropAViewerReAddedAfterASlotFreedUp() async throws {
+        let (session, uplink, relay, _) = try await setUpFullShare()
+        let erin = ViewerKeys(viewerID: ViewerID("e"))
+        await uplink.holdAfterNextAdd()
+        let first = Task { try await session.addViewer(erin.viewerID, publicKey: erin.publicKey) }  // refused (full), reply delayed
+        while await uplink.parkedCount < 1 { await Task.yield() }
+        _ = await session.revoke(keys[0].viewerID)                        // frees a slot at the relay
+        let off = await session.revoke(erin.viewerID)                     // parks behind #1
+        let again = try await session.addViewer(erin.viewerID, publicKey: erin.publicKey)  // parks too: "pending"
+        XCTAssertFalse(off)
+        XCTAssertFalse(again, "pending, not yet acknowledged")
+        await uplink.release()                                           // #1's refusal arrives: it answers an old intent
+        let firstResult = try await first.value
+        XCTAssertTrue(firstResult, "the reconciler sent the latest intent, and the relay accepted it")
+        let onRelay = await relay.viewers(of: share).contains(erin.viewerID)
+        XCTAssertTrue(onRelay)
+        let recipients = await session.recipients
+        XCTAssertTrue(recipients.contains(erin.viewerID), "still sealed for")
+        let pending = await session.unacknowledgedAdds
+        XCTAssertEqual(pending, [])
+        let refused = await session.refusedAdds
+        XCTAssertEqual(refused, [:])
+    }
+
+    func testARefusalMetByAFlushRetryIsReported() async throws {
+        let (session, uplink, _, _) = try await setUpFullShare()
+        let erin = ViewerKeys(viewerID: ViewerID("e"))
+        await uplink.setFailing(true)
+        let acknowledged = try await session.addViewer(erin.viewerID, publicKey: erin.publicKey)
+        XCTAssertFalse(acknowledged, "offline: pending")
+        await uplink.setFailing(false)
+        _ = await session.flushOutbox()                                  // the retry is refused: share is full
+        let refused = await session.refusedAdds
+        XCTAssertEqual(refused, [erin.viewerID: .tooManyViewers(limit: 3)])
+        let pending = await session.unacknowledgedAdds
+        XCTAssertEqual(pending, [])
+        let recipients = await session.recipients
+        XCTAssertFalse(recipients.contains(erin.viewerID))
+    }
+
+    func testAnAddOverlappingStopThrowsShareEnded() async throws {
+        let (session, uplink, _, _) = try await setUp()
+        let dana = ViewerKeys(viewerID: ViewerID("d"))
+        await uplink.holdAfterNextAdd()
+        let adding = Task { try await session.addViewer(dana.viewerID, publicKey: dana.publicKey) }
+        while await uplink.parkedCount < 1 { await Task.yield() }
+        _ = await session.stop()
+        await uplink.release()
+        do {
+            _ = try await adding.value
+            XCTFail("expected shareEnded")
+        } catch {
+            XCTAssertEqual(error as? SessionError, .shareEnded)
+        }
+    }
+
+    func testRevokeAndStopTreatAnUnknownShareAsDone() async throws {
+        let (session, uplink, _, clock) = try await setUp()
+        _ = await session.ingest(fix(0, clock), conditions: walking)
+        await uplink.setUnknownShareOnCleanup(true)                       // the relay already forgot the share
+        let revoked = await session.revoke(keys[0].viewerID)
+        XCTAssertTrue(revoked, "nothing left to delete counts as done")
+        let pending = await session.unacknowledgedRevocations
+        XCTAssertEqual(pending, [], "so the 1 s timer is not retrying it forever")
+        let stopped = await session.stop()
+        XCTAssertTrue(stopped)
+        let stopPending = await session.stopUnacknowledged
+        XCTAssertFalse(stopPending)
     }
 
     func flushWithStopDuringUpload(uploadSucceeds: Bool) async throws -> IngestOutcome {
