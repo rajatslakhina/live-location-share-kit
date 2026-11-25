@@ -34,7 +34,8 @@ public struct AgeRatingDeclaration: Codable, Hashable, Sendable {
 public enum AgeRatingDrift: Hashable, Sendable {
     /// Code can share location with people, but the declaration says it cannot. Blocks the build.
     case undeclaredSharedLocation
-    /// Declared, but no capability uses it. Not wrong, but it raises the rating for nothing. Warns.
+    /// Declared, but no capability uses it. Not wrong, but in Brazil a "Yes" means an A16 rating, so it can
+    /// cost reach for nothing. Warns.
     case overDeclaredSharedLocation
 
     public var isBlocking: Bool { self == .undeclaredSharedLocation }
@@ -44,7 +45,7 @@ public enum AgeRatingDrift: Hashable, Sendable {
         case .undeclaredSharedLocation:
             return "Manifest declares liveLocationSharing but the age-rating declaration answers Shared Location = NO."
         case .overDeclaredSharedLocation:
-            return "Age-rating declaration answers Shared Location = YES but no capability shares location with people."
+            return "Age-rating declaration answers Shared Location = YES but no capability shares location with people (in Brazil this means A16)."
         }
     }
 }

@@ -53,7 +53,11 @@ public struct SealedPoint: Hashable, Sendable, Codable {
 public enum FanoutCryptoError: Error, Equatable, Sendable {
     case notAddressedToMe
     case staleOrReplayed(sequence: UInt64, lastSeen: UInt64)
+    /// The copy names a sharer key this viewer has not pinned for that share (or a different one).
+    /// This is what stops a relay from minting its own key and sealing forged points.
+    case untrustedSharerKey
     case badSharerKey
+    case badViewerKey
     case authenticationFailed
     case malformedPayload
 }
@@ -73,10 +77,30 @@ enum AssociatedData {
         return d
     }
 
-    static func keyInfo(_ viewer: ViewerID) -> Data {
+    /// HKDF info binds the viewer ID *and both public keys*, so a derived key is only ever valid for this
+    /// exact (sharer key, viewer key, viewer ID) triple.
+    static func keyInfo(_ viewer: ViewerID, sharerKey: Data, viewerKey: Data) -> Data {
         var d = Data("LiveLocation.v1/viewer-key".utf8)
-        d.append(Data(viewer.raw.utf8))
+        for part in [Data(viewer.raw.utf8), sharerKey, viewerKey] {
+            var len = UInt32(clamping: part.count).bigEndian
+            withUnsafeBytes(of: &len) { d.append(contentsOf: $0) }
+            d.append(part)
+        }
         return d
+    }
+}
+
+/// Fixed-size plaintext. Without padding the ciphertext length leaks the publish reason (the JSON for
+/// "heartbeat" is longer than for "moved"), which would tell the relay when the sharer is parked.
+/// JSON tolerates trailing whitespace, so padding with spaces needs no framing.
+enum Plaintext {
+    static let bucket = 256
+
+    static func pad(_ json: Data) -> Data {
+        let buckets = max(1, (json.count + bucket - 1) / bucket)
+        var out = json
+        out.append(Data(repeating: 0x20, count: buckets * bucket - json.count))
+        return out
     }
 }
 
@@ -101,17 +125,27 @@ public struct ViewerKeys: Sendable {
     public let viewerID: ViewerID
     let privateKey: Curve25519.KeyAgreement.PrivateKey
     public var publicKey: Data { privateKey.publicKey.rawRepresentation }
+    /// For persisting in the Keychain. Never send it anywhere.
+    public var privateKeyRaw: Data { privateKey.rawRepresentation }
 
     public init(viewerID: ViewerID) {
         self.viewerID = viewerID
         self.privateKey = Curve25519.KeyAgreement.PrivateKey()
     }
+
+    /// Restores a persisted key (after an app relaunch).
+    public init(viewerID: ViewerID, privateKeyRaw: Data) throws {
+        self.viewerID = viewerID
+        do { self.privateKey = try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: privateKeyRaw) }
+        catch { throw FanoutCryptoError.badViewerKey }
+    }
 }
 
 /// Sharer side. One X25519 key per share; each viewer's copy is sealed under
-/// `HKDF(ECDH(shareKey, viewerKey), salt: shareID, info: viewerID)`, and the AEAD tag binds
-/// (shareID, viewerID, sequence). Consequences, each with a test:
-///  * the relay cannot read any copy;
+/// `HKDF(ECDH(shareKey, viewerKey), salt: shareID, info: viewerID ‖ sharerKey ‖ viewerKey)`, and the
+/// AEAD tag binds (shareID, viewerID, sequence). Consequences, each with a test:
+///  * the relay cannot read any copy, and cannot forge one: viewers only accept the sharer key they
+///    pinned for the share (`PerViewerOpener.trust`), delivered out of band with the invitation;
 ///  * a copy re-addressed to another viewer fails authentication;
 ///  * after `revoke`, no copy is ever produced for the revoked key — revocation is enforced by the
 ///    sharer's own device, not by trusting the relay to stop forwarding.
@@ -125,50 +159,79 @@ public struct PerViewerSealer: FanoutSealing {
         self.shareKey = Curve25519.KeyAgreement.PrivateKey()
     }
 
+    /// Restores a persisted share key so a share survives an app relaunch.
+    public init(shareID: ShareID, privateKeyRaw: Data) throws {
+        self.shareID = shareID
+        do { self.shareKey = try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: privateKeyRaw) }
+        catch { throw FanoutCryptoError.badSharerKey }
+    }
+
+    /// The key viewers pin for this share. Send it with the invitation, not via the relay.
+    public var sharePublicKey: Data { shareKey.publicKey.rawRepresentation }
+    /// For persisting in the Keychain. Never send it anywhere.
+    public var privateKeyRaw: Data { shareKey.rawRepresentation }
+
     public var recipients: [ViewerID] { viewerKeys.keys.sorted() }
 
-    /// Adds (or replaces) a viewer's public key. Throws for a key that is not 32 valid bytes.
+    /// Adds (or replaces) a viewer's public key. A trial key agreement runs here, so a malformed or
+    /// low-order key is rejected up front instead of breaking a later publish.
     public mutating func add(_ viewer: ViewerID, publicKey: Data) throws {
-        do { viewerKeys[viewer] = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: publicKey) }
-        catch { throw FanoutCryptoError.badSharerKey }
+        guard let key = try? Curve25519.KeyAgreement.PublicKey(rawRepresentation: publicKey),
+              (try? shareKey.sharedSecretFromKeyAgreement(with: key)) != nil
+        else { throw FanoutCryptoError.badViewerKey }
+        viewerKeys[viewer] = key
     }
 
     public mutating func revoke(_ viewer: ViewerID) { viewerKeys[viewer] = nil }
 
+    /// Seals one copy per recipient. A viewer whose copy cannot be sealed is skipped rather than
+    /// failing everyone else's copy.
     public func sealCopies(_ payload: PointPayload, sequence: UInt64) throws -> [SealedPoint] {
-        let plaintext = try JSONEncoder().encode(payload)
-        let sharerPub = shareKey.publicKey.rawRepresentation
-        return try recipients.compactMap { viewer in
-            guard let pub = viewerKeys[viewer] else { return nil }
-            let key = try Self.derive(shareKey.sharedSecretFromKeyAgreement(with: pub), shareID, viewer)
-            let box = try ChaChaPoly.seal(plaintext, using: key,
-                                          authenticating: AssociatedData.make(shareID, viewer, sequence))
+        let plaintext = Plaintext.pad(try JSONEncoder().encode(payload))
+        let sharerPub = sharePublicKey
+        return recipients.compactMap { viewer in
+            guard let pub = viewerKeys[viewer],
+                  let secret = try? shareKey.sharedSecretFromKeyAgreement(with: pub) else { return nil }
+            let key = Self.derive(secret, shareID, viewer, sharerKey: sharerPub, viewerKey: pub.rawRepresentation)
+            guard let box = try? ChaChaPoly.seal(plaintext, using: key,
+                                                 authenticating: AssociatedData.make(shareID, viewer, sequence))
+            else { return nil }
             return SealedPoint(shareID: shareID, viewerID: viewer, sequence: sequence,
                                sharerPublicKey: sharerPub, ciphertext: box.combined)
         }
     }
 
-    static func derive(_ secret: SharedSecret, _ share: ShareID, _ viewer: ViewerID) -> SymmetricKey {
+    static func derive(_ secret: SharedSecret, _ share: ShareID, _ viewer: ViewerID,
+                       sharerKey: Data, viewerKey: Data) -> SymmetricKey {
         secret.hkdfDerivedSymmetricKey(using: SHA256.self, salt: Data(share.raw.utf8),
-                                       sharedInfo: AssociatedData.keyInfo(viewer), outputByteCount: 32)
+                                       sharedInfo: AssociatedData.keyInfo(viewer, sharerKey: sharerKey, viewerKey: viewerKey),
+                                       outputByteCount: 32)
     }
 }
 
-/// Viewer side. Stateless `tryOpen` for audits; `PointInbox` adds the replay window.
+/// Viewer side. Opens only copies whose sharer key was pinned for that share with `trust(_:sharerPublicKey:)`.
+/// Stateless `tryOpen` for audits; `PointInbox` adds the replay window.
 public struct PerViewerOpener: FanoutOpening {
     public let keys: ViewerKeys
+    public private(set) var trustedSharers: [ShareID: Data] = [:]
     public var viewerID: ViewerID { keys.viewerID }
 
     public init(keys: ViewerKeys) { self.keys = keys }
 
+    /// Pins the sharer key for a share — taken from the invitation, never from a relay-delivered copy.
+    public mutating func trust(_ share: ShareID, sharerPublicKey: Data) { trustedSharers[share] = sharerPublicKey }
+    public mutating func untrust(_ share: ShareID) { trustedSharers[share] = nil }
+
     public func open(_ sealed: SealedPoint) throws -> PointPayload {
         guard sealed.viewerID == viewerID else { throw FanoutCryptoError.notAddressedToMe }
-        guard let sharerPub = try? Curve25519.KeyAgreement.PublicKey(rawRepresentation: sealed.sharerPublicKey)
+        guard let pinned = trustedSharers[sealed.shareID], pinned == sealed.sharerPublicKey
+        else { throw FanoutCryptoError.untrustedSharerKey }
+        guard let sharerPub = try? Curve25519.KeyAgreement.PublicKey(rawRepresentation: pinned)
         else { throw FanoutCryptoError.badSharerKey }
         let plaintext: Data
         do {
             let secret = try keys.privateKey.sharedSecretFromKeyAgreement(with: sharerPub)
-            let key = PerViewerSealer.derive(secret, sealed.shareID, viewerID)
+            let key = PerViewerSealer.derive(secret, sealed.shareID, viewerID, sharerKey: pinned, viewerKey: keys.publicKey)
             let box = try ChaChaPoly.SealedBox(combined: sealed.ciphertext)
             plaintext = try ChaChaPoly.open(box, using: key,
                                             authenticating: AssociatedData.make(sealed.shareID, viewerID, sealed.sequence))
@@ -185,11 +248,18 @@ public struct PerViewerOpener: FanoutOpening {
 
 /// The viewer's receive path: decrypt, then enforce a per-share monotonic sequence so a replayed or
 /// reordered copy can never move a pin backwards.
+///
+/// The replay window lives in memory. An app that must reject replays across its own relaunches persists
+/// `latest[share].sequence` (see README limits).
 public struct PointInbox: Sendable {
-    public let opener: PerViewerOpener
+    public private(set) var opener: PerViewerOpener
     public private(set) var latest: [ShareID: (sequence: UInt64, payload: PointPayload)] = [:]
 
     public init(opener: PerViewerOpener) { self.opener = opener }
+
+    public mutating func trust(_ share: ShareID, sharerPublicKey: Data) {
+        opener.trust(share, sharerPublicKey: sharerPublicKey)
+    }
 
     @discardableResult
     public mutating func receive(_ sealed: SealedPoint) throws -> PointPayload {
@@ -201,7 +271,11 @@ public struct PointInbox: Sendable {
         return payload
     }
 
-    public mutating func forget(_ share: ShareID) { latest[share] = nil }
+    /// Drops the pin and the replay state for a share that ended or was revoked.
+    public mutating func forget(_ share: ShareID) {
+        latest[share] = nil
+        opener.untrust(share)
+    }
 }
 
 // MARK: - Audit

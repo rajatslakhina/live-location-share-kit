@@ -9,8 +9,11 @@ public struct LiveShareDemoView: View {
     @State private var model: ScenarioModel
     @State private var selection: Tab
 
-    public init(manifest: CapabilityManifest, initialTab: Tab = .sharer) {
-        _model = State(initialValue: ScenarioModel(manifest: manifest))
+    /// - Parameters:
+    ///   - manifest: the app's capability manifest (the demo app loads it from its bundle).
+    ///   - declaration: the app's exported App Store Connect age-rating answer (also from the bundle).
+    public init(manifest: CapabilityManifest, declaration: AgeRatingDeclaration, initialTab: Tab = .sharer) {
+        _model = State(initialValue: ScenarioModel(manifest: manifest, declaration: declaration))
         _selection = State(initialValue: initialTab)
     }
 
@@ -19,7 +22,7 @@ public struct LiveShareDemoView: View {
             SharerTab(model: model).tabItem { Label("Sharer", systemImage: "location.fill") }.tag(Tab.sharer)
             ViewersTab(model: model).tabItem { Label("Viewers", systemImage: "person.3.fill") }.tag(Tab.viewers)
             CapacityTab(model: model).tabItem { Label("Capacity", systemImage: "gauge.with.dots.needle.67percent") }.tag(Tab.capacity)
-            GateTab(manifest: model.manifest).tabItem { Label("Age rating", systemImage: "checkmark.shield") }.tag(Tab.gate)
+            GateTab(model: model).tabItem { Label("Age rating", systemImage: "checkmark.shield") }.tag(Tab.gate)
         }
         .task { await model.runIfNeeded() }
     }
@@ -80,10 +83,10 @@ struct SharerTab: View {
                         Card(title: "12 min: walk 3 → drive 4 → parked 5") {
                             HStack {
                                 Metric(value: "\(c.fixesSeen)", label: "fixes from GPS")
-                                Metric(value: "\(c.published)", label: "points sent")
+                                Metric(value: "\(c.uploaded)", label: "points sent")
                                 Metric(value: "\(c.heartbeats)", label: "heartbeats")
                             }
-                            Text("A naive 1 Hz publisher would have sent \(ScenarioModel.scenarioMinutes * 60) points to each viewer.")
+                            Text("Points reached the relay as one sealed copy per viewer. A naive 1 Hz publisher would have sent \(ScenarioModel.scenarioMinutes * 60).")
                                 .font(.footnote).foregroundStyle(.secondary)
                         }
                         Card(title: "Why fixes were not sent") {
@@ -100,7 +103,7 @@ struct SharerTab: View {
                         }
                         if let cad = model.cadence {
                             Card(title: "Cadence now (parked, battery 18 %)") {
-                                Text("Heartbeat every \(Int(cad.heartbeatInterval.seconds))s · presence TTL \(Int(model.presenceTTL.seconds))s")
+                                Text("Heartbeat every \(cad.heartbeatInterval.value / 1_000)s · presence TTL \(model.presenceTTL.value / 1_000)s")
                                     .font(.subheadline)
                             }
                         }
@@ -115,6 +118,7 @@ struct SharerTab: View {
                     }
                 }
                 .padding()
+                .padding(.bottom, 72)   // keep the last card clear of the floating tab bar
             }
             .navigationTitle("Sharing")
         }
@@ -156,21 +160,30 @@ struct ViewersTab: View {
                     }
                 }
                 .padding()
+                .padding(.bottom, 72)   // keep the last card clear of the floating tab bar
             }
             .navigationTitle("Viewers")
         }
     }
 
     private var map: some View {
-        let pins = model.viewers.compactMap { v -> (String, CLLocationCoordinate2D)? in
-            guard let lat = v.latitude, let lon = v.longitude else { return nil }
-            return (v.name, CLLocationCoordinate2D(latitude: lat, longitude: lon))
+        // Viewers who last decrypted the same point share one marker ("Alice, Bob see"), so a pin is never
+        // hidden underneath another.
+        var groups: [(names: [String], coordinate: CLLocationCoordinate2D)] = []
+        for v in model.viewers {
+            guard let lat = v.latitude, let lon = v.longitude else { continue }
+            if let i = groups.firstIndex(where: { $0.coordinate.latitude == lat && $0.coordinate.longitude == lon }) {
+                groups[i].names.append(v.name)
+            } else {
+                groups.append(([v.name], CLLocationCoordinate2D(latitude: lat, longitude: lon)))
+            }
         }
         return Map {
             MapPolyline(coordinates: model.route.map { CLLocationCoordinate2D(latitude: $0.latitude, longitude: $0.longitude) })
                 .stroke(.blue.opacity(0.5), lineWidth: 4)
-            ForEach(pins.indices, id: \.self) { i in
-                Marker("\(pins[i].0) sees", coordinate: pins[i].1).tint(i == 0 ? .green : .orange)
+            ForEach(groups.indices, id: \.self) { i in
+                Marker("\(groups[i].names.joined(separator: ", ")) see", coordinate: groups[i].coordinate)
+                    .tint(i == 0 ? .green : .orange)
             }
         }
         .frame(height: 220)
@@ -205,67 +218,77 @@ struct CapacityTab: View {
     let model: ScenarioModel
 
     var body: some View {
-        let bytes = max(model.copyBytes, 1)
-        let e = FanoutLoadModel.estimate(.reference(copyBytes: bytes))
-        return NavigationStack {
+        NavigationStack {
             ScrollView {
                 VStack(spacing: 12) {
-                    Card(title: "Per 1,000 active shares · 3 viewers each") {
-                        HStack {
-                            Metric(value: fmt(e.publishesPerSecond), label: "publishes / s")
-                            Metric(value: fmt(e.copiesPerSecond), label: "sealed copies / s")
-                        }
-                        HStack {
-                            Metric(value: fmt(e.socketMessagesPerSecond), label: "socket msgs / s")
-                            Metric(value: fmt(e.ingressBytesPerSecond / 1_000), label: "kB / s ingress")
-                        }
-                        Text("A 1 Hz publisher: \(fmt(e.naiveCopiesPerSecond)) copies / s — \(fmt(e.naiveCopiesPerSecond / max(e.copiesPerSecond, 0.001)))× more.")
-                            .font(.footnote).foregroundStyle(.secondary)
-                    }
-                    Card(title: "Background pushes (APNs) per hour") {
-                        HStack {
-                            Metric(value: fmt(e.pushesPerHourUnbudgeted), label: "every copy pushed")
-                            Metric(value: fmt(e.pushesPerHourBudgeted), label: "with budget (1 / \(Int(model.pushRefill.seconds / 60)) min)")
-                        }
-                        Text("Coalescing means a budget-delayed push carries the newest point, not a backlog.")
-                            .font(.footnote).foregroundStyle(.secondary)
-                    }
-                    Card(title: "Storage (latest copy only)") {
-                        Metric(value: "\(e.storedBytes / 1_000) kB", label: "for 3,000 (share, viewer) pairs")
-                        Text("Copy size \(bytes) bytes, measured from the scenario's real sealed copy. Assumes a commuting-hour mix: 55 % parked, 20 % walking, 5 % cycling, 20 % driving; 30 % of viewers in the foreground.")
-                            .font(.footnote).foregroundStyle(.secondary)
+                    if model.finished && model.copyBytes > 0 {
+                        content(FanoutLoadModel.estimate(.reference(copyBytes: model.copyBytes, pushRefill: model.pushRefill)))
+                    } else {
+                        RunningPlaceholder(running: model.isRunning)
                     }
                 }
                 .padding()
+                .padding(.bottom, 72)
             }
             .navigationTitle("Capacity")
         }
     }
 
+    @ViewBuilder
+    private func content(_ e: LoadEstimate) -> some View {
+        let refillMinutes = model.pushRefill.value / 60_000
+        Card(title: "Per 1,000 active shares · 3 viewers each") {
+            HStack {
+                Metric(value: fmt(e.publishesPerSecond), label: "publishes / s")
+                Metric(value: fmt(e.copiesPerSecond), label: "sealed copies / s")
+            }
+            HStack {
+                Metric(value: fmt(e.socketMessagesPerSecond), label: "socket msgs / s")
+                Metric(value: fmt(e.ingressBytesPerSecond / 1_000), label: "kB / s ingress")
+            }
+            Text("A 1 Hz publisher: \(fmt(e.naiveCopiesPerSecond)) copies / s — \(fmt(e.naiveCopiesPerSecond / max(e.copiesPerSecond, 0.001)))× more.")
+                .font(.footnote).foregroundStyle(.secondary)
+        }
+        Card(title: "Background pushes (APNs) per hour") {
+            HStack {
+                Metric(value: fmt(e.pushesPerHourUnbudgeted), label: "every copy pushed")
+                Metric(value: fmt(e.pushesPerHourBudgeted), label: "with budget (1 / \(refillMinutes) min)")
+            }
+            Text("Coalescing means a budget-delayed push carries the newest point, not a backlog.")
+                .font(.footnote).foregroundStyle(.secondary)
+        }
+        Card(title: "Storage (latest copy only)") {
+            Metric(value: "\((e.storedBytes / 1_000).formatted()) kB", label: "for 3,000 (share, viewer) pairs")
+            Text("Copy size \(model.copyBytes) bytes, measured from the scenario's real sealed copy (plaintext padded to a fixed size). Assumes a commuting-hour mix: 55 % parked, 20 % walking, 5 % cycling, 20 % driving; 30 % of viewers in the foreground.")
+                .font(.footnote).foregroundStyle(.secondary)
+        }
+    }
+
     private func fmt(_ d: Double) -> String {
-        d >= 100 ? String(Saturating.int(d.rounded())) : String(format: "%.1f", d)
+        d >= 100 ? Saturating.int(d.rounded()).formatted(.number.grouping(.automatic)) : String(format: "%.1f", d)
     }
 }
 
 // MARK: - Gate
 
 struct GateTab: View {
-    let manifest: CapabilityManifest
-    @State private var declaredSharedLocation = false
+    let model: ScenarioModel
+    @State private var simulateDrift = false
 
     var body: some View {
-        let drift = AgeRatingGate.check(manifest: manifest,
-                                        declaration: AgeRatingDeclaration(sharedLocation: declaredSharedLocation))
-        let withoutCapability = runtimeRefusal()
+        let declared = AgeRatingDeclaration(sharedLocation: simulateDrift ? !model.declaration.sharedLocation
+                                                                            : model.declaration.sharedLocation)
+        let drift = AgeRatingGate.check(manifest: model.manifest, declaration: declared)
         return NavigationStack {
             ScrollView {
                 VStack(spacing: 12) {
-                    Card(title: "Capability manifest (compiled into the app)") {
-                        Text(manifest.capabilities.map(\.rawValue).sorted().joined(separator: ", "))
+                    Card(title: "Capability manifest (bundled config)") {
+                        Text(model.manifest.capabilities.map(\.rawValue).sorted().joined(separator: ", "))
                             .font(.callout.monospaced())
                     }
                     Card(title: "App Store Connect · Shared Location") {
-                        Toggle("Declared \"Yes\"", isOn: $declaredSharedLocation)
+                        Text("Declared: \(declared.sharedLocation ? "Yes" : "No")").font(.headline)
+                        Toggle("Simulate a drifted answer", isOn: $simulateDrift)
                         if drift.isEmpty {
                             Label("Gate passes: code and declaration agree", systemImage: "checkmark.seal.fill").foregroundStyle(.green)
                         } else {
@@ -274,28 +297,20 @@ struct GateTab: View {
                                     .foregroundStyle(d.isBlocking ? .red : .orange).font(.callout)
                             }
                         }
+                        Text("The same check runs in the demo repo's CI against the same two JSON files.")
+                            .font(.footnote).foregroundStyle(.secondary)
                     }
                     Card(title: "Runtime side of the same rule") {
-                        Text("A SharerSession built from a manifest without liveLocationSharing: \(withoutCapability)")
+                        Text("A SharerSession built from a manifest without liveLocationSharing: \(model.refusal.isEmpty ? "…" : model.refusal)")
                             .font(.callout)
-                        Text("Required for all apps by 12 Jan 2027 (Apple, 16 Nov 2026).").font(.footnote).foregroundStyle(.secondary)
+                        Text("Required for all apps by 12 Jan 2027 (Apple, 16 Nov 2026). In Brazil, Shared Location means an A16 rating.")
+                            .font(.footnote).foregroundStyle(.secondary)
                     }
                 }
                 .padding()
+                .padding(.bottom, 72)
             }
             .navigationTitle("Age rating")
-        }
-    }
-
-    private func runtimeRefusal() -> String {
-        let relay = LocationRelay()
-        do {
-            _ = try SharerSession(shareID: ShareID("x"), manifest: CapabilityManifest(capabilities: [.locationForAppFeatures]),
-                                  sealer: PerViewerSealer(shareID: ShareID("x")), uplink: relay,
-                                  clock: SystemClock(), presenceTTL: .seconds(120))
-            return "started (gate is broken)"
-        } catch {
-            return "refused (\(error))"
         }
     }
 }

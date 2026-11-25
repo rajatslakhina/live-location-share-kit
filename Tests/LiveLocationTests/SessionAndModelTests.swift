@@ -25,7 +25,12 @@ actor GatedUplink: RelayUplink {
         return await relay.publish(copies)
     }
 
-    func revoke(_ viewer: ViewerID, from share: ShareID) async throws { await relay.revoke(viewer, from: share) }
+    func revoke(_ viewer: ViewerID, from share: ShareID) async throws {
+        if failing { throw URLError(.notConnectedToInternet) }
+        await relay.revoke(viewer, from: share)
+    }
+
+    func stop(_ share: ShareID) async throws { await relay.stopShare(share) }
 }
 
 final class SharerSessionTests: XCTestCase {
@@ -33,8 +38,9 @@ final class SharerSessionTests: XCTestCase {
     let manifest = CapabilityManifest(capabilities: [.liveLocationSharing])
     let walking = DeviceConditions(batteryLevel: 0.9, motion: .walking)
     let keys = ["a", "b", "c"].map { ViewerKeys(viewerID: ViewerID($0)) }
+    var sealer = PerViewerSealer(shareID: ShareID("s"))
 
-    func setUp(budget: Int = 120) async throws -> (SharerSession, GatedUplink, LocationRelay, ManualClock) {
+    func setUp(budget: Int = 120, startingSequence: UInt64? = 1) async throws -> (SharerSession, GatedUplink, LocationRelay, ManualClock) {
         let clock = ManualClock(start: Instant(millis: 1_000_000))
         let relay = LocationRelay(configuration: RelayConfiguration(presenceTTL: .seconds(120)), clock: clock)
         try await relay.startShare(share, viewers: Set(keys.map(\.viewerID)), duration: .hours(1))
@@ -42,7 +48,9 @@ final class SharerSessionTests: XCTestCase {
         for k in keys { try sealer.add(k.viewerID, publicKey: k.publicKey) }
         let uplink = GatedUplink(relay: relay)
         let session = try SharerSession(shareID: share, manifest: manifest, sealer: sealer, uplink: uplink, clock: clock,
-                                        presenceTTL: .seconds(120), discretionaryBudget: budget, budgetRefill: .hours(1))
+                                        presenceTTL: relay.configuration.presenceTTL, discretionaryBudget: budget,
+                                        budgetRefill: .hours(1), startingSequence: startingSequence)
+        self.sealer = sealer
         return (session, uplink, relay, clock)
     }
 
@@ -102,6 +110,124 @@ final class SharerSessionTests: XCTestCase {
         XCTAssertNil(carolCopy, "and the late pre-revoke copy is refused by the relay")
     }
 
+    func testRevokeDuringAFailingUploadNeverLeaksToTheRevokedViewer() async throws {
+        let (session, uplink, relay, clock) = try await setUp()
+        let carol = ViewerID("c")
+        _ = await session.ingest(fix(0, clock), conditions: walking)
+        clock.advance(by: .seconds(20))
+        await uplink.holdNextUpload()
+        let inFlightFix = fix(0.001, clock), conditions = walking
+        let inFlight = Task { await session.ingest(inFlightFix, conditions: conditions) }   // sealed for c, parked
+        while await uplink.uploads.count < 2 { await Task.yield() }
+        await uplink.setFailing(true)                                                   // network dies
+        let acknowledged = await session.revoke(carol)
+        XCTAssertFalse(acknowledged, "the relay never heard about it")
+        await uplink.release()
+        let outcome = await inFlight.value
+        XCTAssertEqual(outcome, .heldOffline(sequence: 2))
+        let held = await session.heldBatchRecipients
+        XCTAssertEqual(held, [ViewerID("a"), ViewerID("b")], "the batch sealed before the revoke went back to the outbox without Carol")
+        await uplink.setFailing(false)
+        let pendingBefore = await session.unacknowledgedRevocations
+        XCTAssertEqual(pendingBefore, [carol])
+        _ = await session.flushOutbox()
+        let uploads = await uplink.uploads
+        XCTAssertFalse(uploads.last?.contains { $0.viewerID == carol } ?? true, "and nothing addressed to Carol was uploaded")
+        let pendingAfter = await session.unacknowledgedRevocations
+        XCTAssertEqual(pendingAfter, [], "the relay revocation was retried and acknowledged")
+        let carolOnShare = await relay.viewers(of: share).contains(carol)
+        XCTAssertFalse(carolOnShare)
+    }
+
+    func testARelaunchedSessionOnTheSameShareIsAccepted() async throws {
+        // Default sequences are epoch-based, so a fresh session (new process, same share key) starts above
+        // everything the old one sent.
+        let (old, _, relay, clock) = try await setUp(startingSequence: nil)
+        for i in 1...5 {
+            _ = await old.ingest(fix(Double(i) * 0.001, clock), conditions: walking)
+            clock.advance(by: .seconds(20))
+        }
+        let restored = try PerViewerSealer(shareID: share, privateKeyRaw: sealer.privateKeyRaw)
+        var restoredWithViewers = restored
+        for k in keys { try restoredWithViewers.add(k.viewerID, publicKey: k.publicKey) }
+        let relaunched = try SharerSession(shareID: share, manifest: manifest, sealer: restoredWithViewers,
+                                           uplink: relay, clock: clock, presenceTTL: relay.configuration.presenceTTL)
+        let outcome = await relaunched.ingest(fix(0.5, clock), conditions: walking)
+        guard case .published(.first, _, let receipt) = outcome else { return XCTFail("\(outcome)") }
+        XCTAssertEqual(receipt.rejected, [:], "not mistaken for a replay")
+        var opener = PerViewerOpener(keys: keys[0])
+        opener.trust(share, sharerPublicKey: sealer.sharePublicKey)    // the pin from the original invitation
+        let latest = await relay.latest(share, for: keys[0].viewerID)
+        XCTAssertEqual(try opener.open(try XCTUnwrap(latest)).fix.latitude, 0.5)
+        // Control: a relaunch that restarted sequences at 1 would be locked out.
+        let naive = try SharerSession(shareID: share, manifest: manifest, sealer: restoredWithViewers, uplink: relay,
+                                      clock: clock, presenceTTL: relay.configuration.presenceTTL, startingSequence: 1)
+        clock.advance(by: .seconds(20))
+        let locked = await naive.ingest(fix(0.6, clock), conditions: walking)
+        guard case .published(_, _, let lockedReceipt) = locked else { return XCTFail("\(locked)") }
+        XCTAssertEqual(Set(lockedReceipt.rejected.values), [.staleSequence])
+    }
+
+    func testEpochSequenceIsMonotonicInTimeAndNeverTraps() {
+        XCTAssertLessThan(SharerSession.epochSequence(Instant(millis: 1_000)), SharerSession.epochSequence(Instant(millis: 1_001)))
+        XCTAssertEqual(SharerSession.epochSequence(Instant(millis: -5)), 0)
+        XCTAssertEqual(SharerSession.epochSequence(Instant(millis: .max)), UInt64.max / 2)
+    }
+
+    func testSessionStopsWhenTheRelayHasForgottenTheShare() async throws {
+        let (session, uplink, relay, clock) = try await setUp()
+        _ = await session.ingest(fix(0, clock), conditions: walking)
+        await relay.stopShare(share)                                  // e.g. expired server-side
+        clock.advance(by: .seconds(61))
+        let outcome = await session.tick(conditions: walking)
+        XCTAssertEqual(outcome, .ended)
+        let uploadsAtEnd = await uplink.uploads.count
+        clock.advance(by: .seconds(61))
+        let after = await session.tick(conditions: walking)
+        XCTAssertEqual(after, .ended)
+        let uploadsLater = await uplink.uploads.count
+        XCTAssertEqual(uploadsLater, uploadsAtEnd, "nothing more is sealed or uploaded")
+    }
+
+    func testStopEndsLocallyAndAtTheRelay() async throws {
+        let (session, _, relay, clock) = try await setUp()
+        _ = await session.ingest(fix(0, clock), conditions: walking)
+        await session.stop()
+        let ended = await session.isEnded
+        XCTAssertTrue(ended)
+        let presence = await relay.presence(of: share)
+        XCTAssertEqual(presence, .unknownShare)
+        let again = await session.ingest(fix(0.1, clock), conditions: walking)
+        XCTAssertEqual(again, .ended)
+    }
+
+    func testAHeartbeatOnAPoorFixResendsTheLastGoodFix() async throws {
+        let (session, _, relay, clock) = try await setUp()
+        _ = await session.ingest(fix(0.25, clock), conditions: walking)
+        clock.advance(by: .seconds(61))
+        let poor = try XCTUnwrap(LocationFix(latitude: 0.9, longitude: 0, accuracyMeters: 900, timestamp: clock.now()))
+        let outcome = await session.ingest(poor, conditions: walking)
+        guard case .published(.heartbeat, _, _) = outcome else { return XCTFail("\(outcome)") }
+        var opener = PerViewerOpener(keys: keys[0])
+        opener.trust(share, sharerPublicKey: sealer.sharePublicKey)
+        let latest = await relay.latest(share, for: keys[0].viewerID)
+        XCTAssertEqual(try opener.open(try XCTUnwrap(latest)).fix.latitude, 0.25, "the 900 m estimate never reaches a viewer")
+    }
+
+    func testCountersSeparateSealedFromUploaded() async throws {
+        let (session, uplink, _, clock) = try await setUp()
+        await uplink.setFailing(true)
+        _ = await session.ingest(fix(0, clock), conditions: walking)
+        var c = await session.counters
+        XCTAssertEqual(c.sealed, 1)
+        XCTAssertEqual(c.uploaded, 0)
+        XCTAssertEqual(c.heldOffline, 1)
+        await uplink.setFailing(false)
+        _ = await session.flushOutbox()
+        c = await session.counters
+        XCTAssertEqual(c.uploaded, 1, "counted once, when the relay actually received it")
+    }
+
     func testOfflineOutboxKeepsOnlyTheNewestBatch() async throws {
         let (session, uplink, relay, clock) = try await setUp()
         await uplink.setFailing(true)
@@ -146,7 +272,8 @@ final class SharerSessionTests: XCTestCase {
 
     func testTickRepublishesTheLastFixWithAFreshSentAt() async throws {
         let (session, _, relay, clock) = try await setUp()
-        let opener = PerViewerOpener(keys: keys[0])
+        var opener = PerViewerOpener(keys: keys[0])
+        opener.trust(share, sharerPublicKey: sealer.sharePublicKey)
         let initial = await session.tick(conditions: walking)
         XCTAssertEqual(initial, .idle, "nothing published yet, nothing to heartbeat")
         _ = await session.ingest(fix(0.5, clock), conditions: walking)
@@ -169,7 +296,8 @@ final class SharerSessionTests: XCTestCase {
 final class PresenceInvariantTests: XCTestCase {
     /// Drives a stationary sharer for 10 minutes against the real relay and counts seconds in which the
     /// relay reports `.away`. The cadence function is injected so a broken policy can be fed in.
-    func awaySeconds(cadence: (DeviceConditions, Millis) -> PublishCadence) async throws -> Int {
+    func awaySeconds(dropEveryOtherHeartbeat: Bool = false,
+                     cadence: (DeviceConditions, Millis) -> PublishCadence) async throws -> Int {
         let clock = ManualClock()
         let ttl = Millis.seconds(120)
         let relay = LocationRelay(configuration: RelayConfiguration(presenceTTL: ttl), clock: clock)
@@ -180,12 +308,15 @@ final class PresenceInvariantTests: XCTestCase {
         var away = 0
         let parked = DeviceConditions(batteryLevel: 0.05, isLowPowerMode: true, motion: .stationary)
         let spot = try XCTUnwrap(LocationFix(latitude: 1, longitude: 1, accuracyMeters: 5, timestamp: clock.now()))
+        var beats = 0
         for second in 0..<600 {
             let c = cadence(parked, ttl)
             if second == 0 || gate.heartbeatDue(now: clock.now(), cadence: c) {
                 seq += 1
+                beats += 1
                 gate.commit(spot, at: clock.now())
-                _ = await relay.publish([sealedCopy("p", "v", seq)])
+                let lost = dropEveryOtherHeartbeat && beats % 2 == 0
+                if !lost { _ = await relay.publish([sealedCopy("p", "v", seq)]) }
             }
             if case .away = await relay.presence(of: share) { away += 1 }
             clock.advance(by: .seconds(1))
@@ -196,6 +327,19 @@ final class PresenceInvariantTests: XCTestCase {
     func testRealPolicyNeverLetsPresenceLapseForAnOnlineSharer() async throws {
         let away = try await awaySeconds { PublishPolicy.cadence(for: $0, presenceTTL: $1) }
         XCTAssertEqual(away, 0)
+    }
+
+    func testOneLostHeartbeatInARowStillNeverLetsPresenceLapse() async throws {
+        // The TTL / 2 rationale: lose every other heartbeat and the next one still lands within the TTL.
+        let away = try await awaySeconds(dropEveryOtherHeartbeat: true) { PublishPolicy.cadence(for: $0, presenceTTL: $1) }
+        XCTAssertEqual(away, 0)
+        // Control: a heartbeat just under the TTL (the weaker "strictly shorter" rule) fails the same test.
+        let weak = try await awaySeconds(dropEveryOtherHeartbeat: true) { c, ttl in
+            let real = PublishPolicy.cadence(for: c, presenceTTL: ttl)
+            return PublishCadence(minInterval: real.minInterval, minDistanceMeters: real.minDistanceMeters,
+                                  heartbeatInterval: Millis(ttl.value - 1_000))
+        }
+        XCTAssertGreaterThan(weak, 0)
     }
 
     func testTheCheckCatchesAPolicyWhoseHeartbeatOutlivesTheTTL() async throws {
@@ -253,7 +397,9 @@ final class LoadModelTests: XCTestCase {
     func testHostileInputsGiveFiniteNonNegativeOutput() {
         let e = FanoutLoadModel.estimate(LoadAssumptions(activeShares: -5, meanViewersPerShare: .nan, motionMix: [.walking: -.infinity],
                                                          foregroundFraction: 7, copyBytes: -1, presenceTTL: .zero, pushRefill: .zero))
-        for v in [e.publishesPerSecond, e.copiesPerSecond, e.socketMessagesPerSecond, e.pushesPerHourBudgeted, e.ingressBytesPerSecond] {
+        for v in [e.publishesPerSecond, e.copiesPerSecond, e.socketMessagesPerSecond, e.pushesPerHourUnbudgeted,
+                  e.pushesPerHourBudgeted, e.ingressBytesPerSecond, e.naiveCopiesPerSecond, e.foregroundConnections,
+                  e.backgroundViewers] {
             XCTAssertTrue(v.isFinite && v >= 0)
         }
         XCTAssertEqual(e.storedBytes, 0)
@@ -262,13 +408,28 @@ final class LoadModelTests: XCTestCase {
         XCTAssertEqual(huge.storedBytes, .max, "saturates instead of trapping in Int(Double)")
     }
 
-    func testBudgetNeverIncreasesPushes() {
-        for refill in [Millis.seconds(1), .seconds(10), .minutes(5), .hours(1)] {
-            let a = LoadAssumptions(activeShares: 1_000, meanViewersPerShare: 3, motionMix: [.driving: 1], foregroundFraction: 0,
-                                    copyBytes: 200, presenceTTL: .seconds(120), pushRefill: refill)
-            let e = FanoutLoadModel.estimate(a)
-            XCTAssertLessThanOrEqual(e.pushesPerHourBudgeted, e.pushesPerHourUnbudgeted)
-        }
+    func testABudgetLooserThanThePublishRateChangesNothing() {
+        // Driving publishes every 5 s (720/h per viewer). A 1 s refill (3,600/h) never binds; a 5 min refill does.
+        let loose = FanoutLoadModel.estimate(LoadAssumptions(activeShares: 1_000, meanViewersPerShare: 3, motionMix: [.driving: 1],
+                                                             foregroundFraction: 0, copyBytes: 200, presenceTTL: .seconds(120),
+                                                             pushRefill: .seconds(1)))
+        XCTAssertEqual(loose.pushesPerHourBudgeted, loose.pushesPerHourUnbudgeted, accuracy: 1e-6)
+        XCTAssertEqual(loose.pushesPerHourUnbudgeted, 3_000 * 720, accuracy: 1e-6)
+        let tight = FanoutLoadModel.estimate(LoadAssumptions(activeShares: 1_000, meanViewersPerShare: 3, motionMix: [.driving: 1],
+                                                             foregroundFraction: 0, copyBytes: 200, presenceTTL: .seconds(120),
+                                                             pushRefill: .minutes(5)))
+        XCTAssertEqual(tight.pushesPerHourBudgeted, 3_000 * 12, accuracy: 1e-6)
+    }
+
+    func testTenMillionSharesFiguresQuotedInTheREADME() {
+        let e = FanoutLoadModel.estimate(.reference(copyBytes: 365, activeShares: 10_000_000))
+        XCTAssertEqual(e.publishesPerSecond, 675_000, accuracy: 1e-3)
+        XCTAssertEqual(e.copiesPerSecond, 2_025_000, accuracy: 1e-3)
+        XCTAssertEqual(e.foregroundConnections, 9_000_000, accuracy: 1e-3)
+        XCTAssertEqual(e.backgroundViewers, 21_000_000, accuracy: 1e-3)
+        XCTAssertEqual(e.pushesPerHourBudgeted, 252_000_000, accuracy: 1e-1)
+        XCTAssertEqual(e.ingressBytesPerSecond, 739_125_000, accuracy: 1)
+        XCTAssertEqual(e.storedBytes, 10_950_000_000)
     }
 }
 

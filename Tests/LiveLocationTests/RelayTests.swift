@@ -64,7 +64,7 @@ final class RelayTests: XCTestCase {
     func testShareExpiresByTimeAndEverythingIsDeleted() async throws {
         let (relay, clock) = makeRelay()
         try await relay.startShare(s, viewers: [a, b], duration: .minutes(10))
-        let stream = await relay.connect(a)
+        let conn = await relay.connect(a)
         _ = await relay.publish([sealedCopy("s", "a", 1), sealedCopy("s", "b", 1)])     // b is offline: queued for push
         clock.advance(by: .minutes(10))
         let afterExpiry = await relay.publish([sealedCopy("s", "a", 2)])
@@ -75,14 +75,58 @@ final class RelayTests: XCTestCase {
         XCTAssertEqual(stats.pendingPushes, 0)
         let presence = await relay.presence(of: s)
         XCTAssertEqual(presence, .unknownShare)
-        let events = await firstEvents(stream, count: 2)
-        XCTAssertEqual(events, [.point(sealedCopy("s", "a", 1)), .ended(s, .expired)])
+        let points = await first(conn.points, count: 1)
+        XCTAssertEqual(points, [sealedCopy("s", "a", 1)])
+        let control = await first(conn.control, count: 1)
+        XCTAssertEqual(control, [.ended(s, .expired)])
+    }
+
+    func testAnExpiredButUnsweptIDCanBeRestarted() async throws {
+        let (relay, clock) = makeRelay()
+        try await relay.startShare(s, viewers: [a], duration: .minutes(1))
+        clock.advance(by: .minutes(2))                       // expired; nothing has swept yet
+        try await relay.startShare(s, viewers: [a], duration: .minutes(1))
+        let expiry = await relay.expiry(of: s)
+        XCTAssertEqual(expiry, clock.now().adding(.minutes(1)))
+    }
+
+    func testAddViewerMidShareRespectsTheLimit() async throws {
+        let (relay, _) = makeRelay(RelayConfiguration(maxViewersPerShare: 2))
+        try await relay.startShare(s, viewers: [a], duration: .hours(1))
+        let before = await relay.publish([sealedCopy("s", "b", 1)])
+        XCTAssertEqual(before.rejected[b], .notARecipient)
+        try await relay.addViewer(b, to: s)
+        let after = await relay.publish([sealedCopy("s", "b", 2)])
+        XCTAssertEqual(after.queuedForPush, [b])
+        await XCTAssertThrowsAsync(try await relay.addViewer(c, to: s), .tooManyViewers(limit: 2))
+        await XCTAssertThrowsAsync(try await relay.addViewer(c, to: ShareID("nope")), .unknownShare)
+        let sharesForB = await relay.shares(for: b)
+        XCTAssertEqual(sharesForB, [s])
+    }
+
+    func testPushQueueIsServedOldestFirstSoABusyShareCannotStarveAQuietOne() async throws {
+        let (relay, clock) = makeRelay(RelayConfiguration(pushBurst: 1, pushRefill: .minutes(5)))
+        let busy = ShareID("a-busy"), quiet = ShareID("b-quiet")
+        try await relay.startShare(busy, viewers: [a], duration: .hours(2))
+        try await relay.startShare(quiet, viewers: [a], duration: .hours(2))
+        _ = await relay.publish([sealedCopy("a-busy", "a", 1)])
+        _ = await relay.drainPushes()                          // spends the only token
+        clock.advance(by: .seconds(10))
+        _ = await relay.publish([sealedCopy("b-quiet", "a", 1)])  // quiet share starts waiting at t=10 s
+        var delivered: [String] = []
+        for minute in 1...10 {
+            clock.advance(by: .minutes(1))
+            _ = await relay.publish([sealedCopy("a-busy", "a", UInt64(minute + 1))])   // busy keeps publishing
+            delivered += await relay.drainPushes().map(\.sealed.shareID.raw)
+        }
+        XCTAssertEqual(delivered.first, "b-quiet", "the quiet share waited longest, so it goes first")
+        XCTAssertTrue(delivered.contains("a-busy"))
     }
 
     func testRevocationDeletesStoredCopyAndQueuedPushAndNotifies() async throws {
         let (relay, _) = makeRelay()
         try await relay.startShare(s, viewers: [a, b], duration: .hours(1))
-        let stream = await relay.connect(a)
+        let conn = await relay.connect(a)
         _ = await relay.publish([sealedCopy("s", "a", 1), sealedCopy("s", "b", 1)])
         await relay.revoke(b, from: s)
         await relay.revoke(a, from: s)
@@ -91,10 +135,12 @@ final class RelayTests: XCTestCase {
         XCTAssertEqual(stats.pendingPushes, 0)
         let late = await relay.publish([sealedCopy("s", "b", 2)])
         XCTAssertEqual(late.rejected[b], .notARecipient, "a copy sealed before revocation is refused when it arrives after")
-        let events = await firstEvents(stream, count: 2)
-        XCTAssertEqual(events, [.point(sealedCopy("s", "a", 1)), .revoked(s)])
+        let control = await first(conn.control, count: 1)
+        XCTAssertEqual(control, [.revoked(s)])
         let pushes = await relay.drainPushes()
         XCTAssertEqual(pushes, [])
+        let budgets = await relay.stats.pushBudgets
+        XCTAssertEqual(budgets, 0, "viewers on no share keep no budget entry")
     }
 
     func testPresenceGoesAwayAfterTTL() async throws {
@@ -135,30 +181,33 @@ final class RelayTests: XCTestCase {
         try await relay.startShare(s, viewers: [a], duration: .hours(1))
         _ = await relay.publish([sealedCopy("s", "a", 1)])
         _ = await relay.publish([sealedCopy("s", "a", 2)])
-        let stream = await relay.connect(a)
+        let conn = await relay.connect(a)
         let pendingAfterConnect = await relay.stats.pendingPushes
         XCTAssertEqual(pendingAfterConnect, 0)
-        let events = await firstEvents(stream, count: 1)
-        XCTAssertEqual(events, [.point(sealedCopy("s", "a", 2))], "catch-up is the latest copy only")
+        let events = await first(conn.points, count: 1)
+        XCTAssertEqual(events, [sealedCopy("s", "a", 2)], "catch-up is the latest copy only")
         let r = await relay.publish([sealedCopy("s", "a", 3)])
         XCTAssertEqual(r.deliveredLive, [a])
     }
 
-    func testSlowConsumerKeepsOnlyNewestEventsAndNeverBlocksTheRelay() async throws {
+    func testSlowConsumerKeepsOnlyNewestPointsButNeverLosesControlEvents() async throws {
         let (relay, _) = makeRelay(RelayConfiguration(connectionBuffer: 3))
         try await relay.startShare(s, viewers: [a], duration: .hours(1))
-        let stream = await relay.connect(a)
-        for seq in 1...100 as ClosedRange<UInt64> { _ = await relay.publish([sealedCopy("s", "a", seq)]) }
-        let events = await firstEvents(stream, count: 3)
-        XCTAssertEqual(events, [.point(sealedCopy("s", "a", 98)), .point(sealedCopy("s", "a", 99)), .point(sealedCopy("s", "a", 100))])
+        let conn = await relay.connect(a)
+        for seq in 1...50 as ClosedRange<UInt64> { _ = await relay.publish([sealedCopy("s", "a", seq)]) }
+        await relay.revoke(a, from: s)                       // the "remove the pin" event, mid-burst
+        let events = await first(conn.points, count: 3)
+        XCTAssertEqual(events, [sealedCopy("s", "a", 48), sealedCopy("s", "a", 49), sealedCopy("s", "a", 50)])
+        let control = await first(conn.control, count: 1)
+        XCTAssertEqual(control, [.revoked(s)], "a points burst can never evict a control event")
     }
 
     func testDisconnectedStreamFallsBackToPush() async throws {
         let (relay, _) = makeRelay()
         try await relay.startShare(s, viewers: [a], duration: .hours(1))
-        var stream: AsyncStream<RelayEvent>? = await relay.connect(a)
-        XCTAssertNotNil(stream)
-        stream = nil                                          // dropping the last reference terminates it
+        var conn: RelayConnection? = await relay.connect(a)
+        XCTAssertNotNil(conn)
+        conn = nil                                            // dropping the last reference terminates it
         for _ in 0..<200 {
             if await relay.stats.liveConnections == 0 { break }
             await Task.yield()
@@ -182,9 +231,9 @@ final class RelayTests: XCTestCase {
     // MARK: helpers
 
     /// Reads up to `count` events, giving up after `timeout` so a regression fails the test instead of hanging it.
-    func firstEvents(_ stream: AsyncStream<RelayEvent>, count: Int, timeout: Duration = .seconds(2)) async -> [RelayEvent] {
+    func first<T: Sendable>(_ stream: AsyncStream<T>, count: Int, timeout: Duration = .seconds(2)) async -> [T] {
         let reader = Task {
-            var out: [RelayEvent] = []
+            var out: [T] = []
             for await e in stream {
                 out.append(e)
                 if out.count == count { break }

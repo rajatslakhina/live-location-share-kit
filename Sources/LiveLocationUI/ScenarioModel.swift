@@ -13,8 +13,10 @@ actor SwitchableUplink: RelayUplink {
         return await relay.publish(copies)
     }
     func revoke(_ viewer: ViewerID, from share: ShareID) async throws {
+        if isDown { throw URLError(.notConnectedToInternet) }
         await relay.revoke(viewer, from: share)
     }
+    func stop(_ share: ShareID) async throws { await relay.stopShare(share) }
 }
 
 /// One viewer as the demo renders them.
@@ -43,14 +45,21 @@ public struct TimelineEntry: Identifiable, Hashable, Sendable {
 
 /// Drives a deterministic 12-minute scenario through the real library types: `SharerSession` →
 /// `PerViewerSealer` → `LocationRelay` → (stream | budgeted push) → `PointInbox` per viewer.
+///
+/// It lives in the package (not the app) so its numbers are covered by `LiveLocationUITests` — the
+/// demo README quotes them, and a test fails if they drift.
 @MainActor
 @Observable
 public final class ScenarioModel {
     public static let scenarioMinutes: Int64 = 12
     /// Deliberately small so the scenario visibly runs the battery budget dry while driving.
     public static let demoBudget = 24
+    /// Seconds at which the script injects one poor-accuracy fix and one re-delivered (older) fix.
+    static let inaccurateFixSecond: Int64 = 100
+    static let reorderedFixSecond: Int64 = 130
 
     public let manifest: CapabilityManifest
+    public let declaration: AgeRatingDeclaration
     public private(set) var isRunning = false
     public private(set) var finished = false
     public private(set) var counters = SessionCounters()
@@ -63,23 +72,28 @@ public final class ScenarioModel {
     public private(set) var route: [RoutePoint] = []
     public private(set) var copyBytes = 0
     public private(set) var flushedAfterOutage = false
+    public private(set) var refusal = ""
 
     private let clock = ManualClock(start: Instant(millis: 1_764_000_000_000))
-    private let shareID = ShareID("share-rajat-commute")
-    private let config = RelayConfiguration(presenceTTL: .seconds(120), pushBurst: 4, pushRefill: .minutes(5))
+    /// Random, so the relay learns nothing from the identifier itself.
+    private let shareID = ShareID(UUID().uuidString)
+    private let config = RelayConfiguration(presenceTTL: .seconds(120), pushBurst: 4, pushRefill: .minutes(6))
     private var inboxes: [ViewerID: PointInbox] = [:]
     private var receivedCount: [ViewerID: Int] = [:]
     private var rejectedCount: [ViewerID: Int] = [:]
+    private var expectedLive: [ViewerID: Int] = [:]
     private var revoked: Set<ViewerID> = []
     private var consumers: [Task<Void, Never>] = []
 
     let alice = ViewerID("alice"), bob = ViewerID("bob"), carol = ViewerID("carol")
     private let names: [ViewerID: String]
 
-    /// - Parameter manifest: the app's capability manifest. The demo app passes its compiled-in copy;
-    ///   without `.liveLocationSharing` the session refuses to start.
-    public init(manifest: CapabilityManifest) {
+    /// - Parameters:
+    ///   - manifest: the app's capability manifest. Without `.liveLocationSharing` the session refuses to start.
+    ///   - declaration: the app's exported App Store Connect answer, shown on the Age rating tab.
+    public init(manifest: CapabilityManifest, declaration: AgeRatingDeclaration) {
         self.manifest = manifest
+        self.declaration = declaration
         self.names = [alice: "Alice", bob: "Bob", carol: "Carol"]
     }
 
@@ -91,20 +105,24 @@ public final class ScenarioModel {
         guard !isRunning, !finished else { return }
         isRunning = true
         defer { isRunning = false; finished = true }
+        refusal = Self.runtimeRefusal()
 
         let relay = LocationRelay(configuration: config, clock: clock)
         let uplink = SwitchableUplink(relay: relay)
         var sealer = PerViewerSealer(shareID: shareID)
         for id in [alice, bob, carol] {
             let keys = ViewerKeys(viewerID: id)
-            inboxes[id] = PointInbox(opener: PerViewerOpener(keys: keys))
+            var inbox = PointInbox(opener: PerViewerOpener(keys: keys))
+            // The invitation carries the share's public key out of band; viewers pin it.
+            inbox.trust(shareID, sharerPublicKey: sealer.sharePublicKey)
+            inboxes[id] = inbox
             do { try sealer.add(id, publicKey: keys.publicKey) } catch { log(0, "Bad key for \(id)"); return }
         }
         let session: SharerSession
         do {
             try await relay.startShare(shareID, viewers: [alice, bob, carol], duration: .hours(1))
             session = try SharerSession(shareID: shareID, manifest: manifest, sealer: sealer, uplink: uplink,
-                                        clock: clock, presenceTTL: config.presenceTTL,
+                                        clock: clock, presenceTTL: relay.configuration.presenceTTL,
                                         discretionaryBudget: Self.demoBudget, budgetRefill: .seconds(60))
         } catch {
             log(0, "Session refused: \(error)")
@@ -114,9 +132,12 @@ public final class ScenarioModel {
 
         // Alice and Carol keep the app open (WebSocket path). Bob is backgrounded (push path).
         for id in [alice, carol] {
-            let stream = await relay.connect(id)
+            let connection = await relay.connect(id)
             consumers.append(Task { @MainActor [weak self] in
-                for await event in stream { self?.handle(event, for: id) }
+                for await point in connection.points { self?.receive(point, for: id) }
+            })
+            consumers.append(Task { @MainActor [weak self] in
+                for await event in connection.control { self?.control(event, for: id) }
             })
         }
 
@@ -136,9 +157,9 @@ public final class ScenarioModel {
             let conditions = DeviceConditions(batteryLevel: battery, motion: motion)
 
             if second == 5 * 60 + 30 {
-                await session.revoke(carol)
+                let acknowledged = await session.revoke(carol)
                 revoked.insert(carol)
-                log(second, "Carol revoked: sharer stops sealing for her; relay deletes her copy")
+                log(second, "Carol revoked: sharer stops sealing for her; relay \(acknowledged ? "deleted" : "will delete") her copy")
             }
             if second == 8 * 60 { await uplink.setDown(true); log(second, "Sharer loses network") }
             if second == 9 * 60 {
@@ -151,18 +172,35 @@ public final class ScenarioModel {
             let outcome: IngestOutcome
             if motion == .stationary {
                 outcome = await session.tick(conditions: conditions)
-            } else if let fix = LocationFix(latitude: lat, longitude: lon, accuracyMeters: 8, timestamp: clock.now()) {
+            } else if second == Self.reorderedFixSecond,
+                      let stale = LocationFix(latitude: lat - 0.0005, longitude: lon, accuracyMeters: 8,
+                                              timestamp: Instant(millis: clock.now().millis - 45_000)) {
+                // A fix stamped 45 s ago arriving now (CoreLocation can re-deliver): older than the last
+                // published point, so the gate must drop it.
+                outcome = await session.ingest(stale, conditions: conditions)
+                if outcome == .suppressed(.outOfOrder) { log(second, "Re-delivered older fix dropped (out of order)") }
+            } else {
+                let accuracy = second == Self.inaccurateFixSecond ? 650.0 : 8.0
+                guard let fix = LocationFix(latitude: lat, longitude: lon, accuracyMeters: accuracy, timestamp: clock.now())
+                else { continue }
                 outcome = await session.ingest(fix, conditions: conditions)
-            } else { outcome = .idle }
-            if case .published(let reason, let seq, let receipt) = outcome, reason != .moved || seq % 8 == 1 {
-                log(second, "#\(seq) \(reason.rawValue) → live \(receipt.deliveredLive.count), push-queued \(receipt.queuedForPush.count)")
+                if outcome == .suppressed(.inaccurate) { log(second, "650 m fix ignored (accuracy)") }
             }
-            if case .heldOffline(let seq) = outcome { log(second, "#\(seq) held offline (outbox keeps newest only)") }
+            if case .published(let reason, let seq, let receipt) = outcome {
+                for v in receipt.deliveredLive { expectedLive[v, default: 0] += 1 }
+                if reason != .moved || seq % 8 == 1 {
+                    log(second, "\(reason.rawValue) → live \(receipt.deliveredLive.count), push-queued \(receipt.queuedForPush.count)")
+                }
+            }
+            if case .heldOffline = outcome { log(second, "Heartbeat held offline (outbox keeps newest only)") }
 
             if second % 30 == 0 {
                 for push in await relay.drainPushes() {
-                    handle(.point(push.sealed), for: push.viewer)
-                    if push.coalesced > 0 { log(second, "Push to \(names[push.viewer] ?? "?") replaced \(push.coalesced) older points") }
+                    receive(push.sealed, for: push.viewer, viaPush: true)
+                    let noun = push.coalesced == 1 ? "point" : "points"
+                    log(second, push.coalesced > 0
+                        ? "Push to \(names[push.viewer] ?? "?") carried the newest point, replacing \(push.coalesced) older \(noun)"
+                        : "Push to \(names[push.viewer] ?? "?")")
                 }
             }
             await Task.yield()
@@ -176,29 +214,37 @@ public final class ScenarioModel {
             copyBytes = sample.approximateByteCount
             sampleCiphertext = sample.ciphertext.prefix(18).map { String(format: "%02x", $0) }.joined()
         }
-        // Let the stream consumers drain before the final render.
-        for _ in 0..<20 { await Task.yield() }
+        // Wait (bounded) until every live delivery has been consumed, so the final render is deterministic.
+        for _ in 0..<10_000 {
+            let drained = [alice, carol].allSatisfy {
+                (receivedCount[$0] ?? 0) + (rejectedCount[$0] ?? 0) >= (expectedLive[$0] ?? 0)
+            }
+            if drained { break }
+            await Task.yield()
+        }
+        consumers.forEach { $0.cancel() }
         refreshViewers()
         log(Self.scenarioMinutes * 60, "Scenario complete")
-        consumers.forEach { $0.cancel() }
     }
 
-    private func handle(_ event: RelayEvent, for viewer: ViewerID) {
+    private func receive(_ sealed: SealedPoint, for viewer: ViewerID, viaPush: Bool = false) {
+        guard var inbox = inboxes[viewer] else { return }
+        do {
+            try inbox.receive(sealed)
+            receivedCount[viewer, default: 0] += 1
+        } catch {
+            rejectedCount[viewer, default: 0] += 1
+        }
+        inboxes[viewer] = inbox
+        if viaPush { refreshViewers() }
+    }
+
+    private func control(_ event: ControlEvent, for viewer: ViewerID) {
         switch event {
-        case .point(let sealed):
-            guard var inbox = inboxes[viewer] else { return }
-            do {
-                try inbox.receive(sealed)
-                receivedCount[viewer, default: 0] += 1
-            } catch {
-                rejectedCount[viewer, default: 0] += 1
-            }
-            inboxes[viewer] = inbox
         case .revoked(let share), .ended(let share, _):
             inboxes[viewer]?.forget(share)
             revoked.insert(viewer)
         }
-        refreshViewers()
     }
 
     private func refreshViewers() {
@@ -221,5 +267,18 @@ public final class ScenarioModel {
         let m = second / 60, s = second % 60
         let stamp = (m < 10 ? "0\(m)" : "\(m)") + ":" + (s < 10 ? "0\(s)" : "\(s)")
         timeline.append(TimelineEntry(id: timeline.count, minute: stamp, text: text))
+    }
+
+    /// The runtime half of the age-rating rule: a session built from a manifest *without*
+    /// `.liveLocationSharing` must refuse to exist.
+    static func runtimeRefusal() -> String {
+        do {
+            _ = try SharerSession(shareID: ShareID("probe"), manifest: CapabilityManifest(capabilities: [.locationForAppFeatures]),
+                                  sealer: PerViewerSealer(shareID: ShareID("probe")), uplink: LocationRelay(),
+                                  clock: ManualClock(), presenceTTL: .seconds(120))
+            return "started (the gate is broken)"
+        } catch {
+            return "refused (\(error))"
+        }
     }
 }

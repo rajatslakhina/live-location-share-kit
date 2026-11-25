@@ -13,5 +13,6 @@ let package = Package(
         .target(name: "LiveLocation"),
         .target(name: "LiveLocationUI", dependencies: ["LiveLocation"]),
         .testTarget(name: "LiveLocationTests", dependencies: ["LiveLocation"]),
+        .testTarget(name: "LiveLocationUITests", dependencies: ["LiveLocation", "LiveLocationUI"]),
     ]
 )

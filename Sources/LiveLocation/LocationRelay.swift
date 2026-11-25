@@ -1,18 +1,20 @@
 import Foundation
 
 public struct RelayConfiguration: Sendable, Hashable {
-    /// A share with no accepted copy for this long reads as `.away`. Clamped to ≥ 2 s so the sharer's
-    /// heartbeat (TTL / 2, floored at 1 s) is always strictly shorter than it.
-    public var presenceTTL: Millis
+    /// A share with no accepted copy for this long reads as `.away`. Clamped to ≥ 2 s, so the sharer's
+    /// heartbeat (`PublishPolicy`: TTL / 2) is always at most half of it. Immutable after `init`, so the
+    /// clamps cannot be undone.
+    public let presenceTTL: Millis
     /// Upper bound on any share's lifetime. "Share until I stop" is still capped; nothing is forever.
-    public var maxShareDuration: Millis
-    public var maxViewersPerShare: Int
-    public var maxActiveShares: Int
+    public let maxShareDuration: Millis
+    public let maxViewersPerShare: Int
+    public let maxActiveShares: Int
     /// Per-viewer push budget (background delivery): burst of `pushBurst`, then one per `pushRefill`.
-    public var pushBurst: Int
-    public var pushRefill: Millis
-    /// Per-connection buffer. A slow foreground consumer drops its *oldest* events, never blocks the relay.
-    public var connectionBuffer: Int
+    public let pushBurst: Int
+    public let pushRefill: Millis
+    /// Per-connection point buffer. A slow foreground consumer drops its *oldest points*, never blocks the
+    /// relay. Control events (revoked / ended) travel on a separate stream and are not dropped this way.
+    public let connectionBuffer: Int
 
     public init(presenceTTL: Millis = .seconds(120), maxShareDuration: Millis = .hours(24),
                 maxViewersPerShare: Int = 50, maxActiveShares: Int = 10_000,
@@ -29,11 +31,17 @@ public struct RelayConfiguration: Sendable, Hashable {
 
 public enum EndReason: String, Sendable, Hashable { case expired, stopped }
 
-/// What a connected (foreground) viewer receives.
-public enum RelayEvent: Sendable, Hashable {
-    case point(SealedPoint)
+/// Share-level events for a connected viewer. Kept off the point stream so a burst of points can never
+/// evict "remove this pin".
+public enum ControlEvent: Sendable, Hashable {
     case revoked(ShareID)
     case ended(ShareID, EndReason)
+}
+
+/// A foreground connection (the WebSocket path): newest-wins points plus a separate control stream.
+public struct RelayConnection: Sendable {
+    public let points: AsyncStream<SealedPoint>
+    public let control: AsyncStream<ControlEvent>
 }
 
 public enum RelayError: Error, Equatable, Sendable {
@@ -42,6 +50,7 @@ public enum RelayError: Error, Equatable, Sendable {
     case tooManyViewers(limit: Int)
     case capacityReached(limit: Int)
     case duplicateShare
+    case unknownShare
 }
 
 public enum RejectReason: String, Sendable, Hashable {
@@ -53,6 +62,13 @@ public struct PublishReceipt: Sendable, Hashable {
     public internal(set) var queuedForPush: [ViewerID] = []
     public internal(set) var rejected: [ViewerID: RejectReason] = [:]
     public init() {}
+
+    /// True when nothing was accepted and every rejection says the share no longer exists — the sharer
+    /// should stop publishing.
+    public var shareIsGone: Bool {
+        deliveredLive.isEmpty && queuedForPush.isEmpty && !rejected.isEmpty
+            && rejected.values.allSatisfy { $0 == .unknownShare || $0 == .shareExpired }
+    }
 }
 
 /// One background push the relay hands to APNs (a Live Activity update carrying the sealed copy).
@@ -78,6 +94,7 @@ public struct RelayStats: Sendable, Hashable {
     public let liveConnections: Int
     public let pushesSent: Int
     public let pushesCoalesced: Int
+    public let pushBudgets: Int
 }
 
 /// The server half of the system, modelled as one actor: presence with a TTL, **only the latest copy per
@@ -86,6 +103,8 @@ public struct RelayStats: Sendable, Hashable {
 ///
 /// Every method is synchronous inside the actor — there is no `await` between reading and writing state,
 /// so there is no actor-reentrancy window. Storage is bounded by `maxActiveShares × maxViewersPerShare`.
+/// Housekeeping is indexed: `sweep()` is O(1) until something is actually due to expire, and per-viewer
+/// cleanup uses a viewer → shares index instead of scanning every share.
 public actor LocationRelay {
     struct ShareRecord {
         var viewers: Set<ViewerID>
@@ -95,16 +114,29 @@ public actor LocationRelay {
     struct Pending {
         var sealed: SealedPoint
         var coalesced: Int
+        /// When the oldest undelivered point for this (viewer, share) arrived. Kept across coalescing so
+        /// the push queue is served oldest-first and a busy share cannot starve a quiet one.
+        let waitingSince: Instant
+    }
+    struct Connection {
+        let points: AsyncStream<SealedPoint>.Continuation
+        let control: AsyncStream<ControlEvent>.Continuation
     }
 
-    public let configuration: RelayConfiguration
+    /// Control backlog per connection. Each share produces at most one `revoked` and one `ended` per viewer,
+    /// so this is only reached by a consumer that never reads; it then keeps the newest events.
+    public static let controlBuffer = 1_024
+
+    public nonisolated let configuration: RelayConfiguration
     private let clock: any LiveClock
 
     private var shares: [ShareID: ShareRecord] = [:]
+    private var viewerShares: [ViewerID: Set<ShareID>] = [:]
+    private var earliestExpiry: Instant?
     private var latest: [ShareID: [ViewerID: SealedPoint]] = [:]
     private var pending: [ViewerID: [ShareID: Pending]] = [:]
     private var pushBudgets: [ViewerID: TokenBucket] = [:]
-    private var connections: [ViewerID: [UUID: AsyncStream<RelayEvent>.Continuation]] = [:]
+    private var connections: [ViewerID: [UUID: Connection]] = [:]
     private var pushesSent = 0
     private var pushesCoalesced = 0
 
@@ -123,14 +155,28 @@ public actor LocationRelay {
         guard viewers.count <= configuration.maxViewersPerShare else {
             throw RelayError.tooManyViewers(limit: configuration.maxViewersPerShare)
         }
+        _ = sweep()                                   // an expired-but-unswept id is free to reuse
         guard shares[id] == nil else { throw RelayError.duplicateShare }
-        _ = sweep()
         guard shares.count < configuration.maxActiveShares else {
             throw RelayError.capacityReached(limit: configuration.maxActiveShares)
         }
         let expiresAt = clock.now().adding(duration)
         shares[id] = ShareRecord(viewers: viewers, expiresAt: expiresAt, lastSeen: nil)
+        for v in viewers { viewerShares[v, default: []].insert(id) }
+        earliestExpiry = min(earliestExpiry ?? expiresAt, expiresAt)
         return expiresAt
+    }
+
+    /// Adds a viewer to a running share (the sharer must also `PerViewerSealer.add` their key).
+    public func addViewer(_ viewer: ViewerID, to share: ShareID) throws {
+        _ = sweep()
+        guard var record = shares[share] else { throw RelayError.unknownShare }
+        guard record.viewers.contains(viewer) || record.viewers.count < configuration.maxViewersPerShare else {
+            throw RelayError.tooManyViewers(limit: configuration.maxViewersPerShare)
+        }
+        record.viewers.insert(viewer)
+        shares[share] = record
+        viewerShares[viewer, default: []].insert(share)
     }
 
     /// Removes one viewer: their stored copy and queued push are deleted immediately and their open
@@ -138,22 +184,21 @@ public actor LocationRelay {
     /// so this is defence in depth, not the only line.
     public func revoke(_ viewer: ViewerID, from share: ShareID) {
         guard shares[share]?.viewers.remove(viewer) != nil else { return }
-        latest[share]?[viewer] = nil
-        pending[viewer]?[share] = nil
-        if pending[viewer]?.isEmpty == true { pending[viewer] = nil }
+        detach(viewer, from: share)
         send(.revoked(share), to: viewer)
-        dropBudgetIfIdle(viewer)
     }
 
     public func stopShare(_ id: ShareID) { end(id, reason: .stopped) }
 
     /// Ends every share whose expiry has passed. Called on each start and publish, and by a timer in a
-    /// real server; idempotent.
+    /// real server; idempotent. O(1) unless the earliest expiry is due.
     @discardableResult
     public func sweep() -> [ShareID] {
         let now = clock.now()
+        guard let due = earliestExpiry, now >= due else { return [] }
         let expired = shares.filter { now >= $0.value.expiresAt }.keys.sorted { $0.raw < $1.raw }
         for id in expired { end(id, reason: .expired) }
+        earliestExpiry = shares.values.map(\.expiresAt).min()
         return expired
     }
 
@@ -168,6 +213,8 @@ public actor LocationRelay {
                 receipt.rejected[copy.viewerID] = .unknownShare   // includes shares just swept
                 continue
             }
+            // Unreachable after `sweep()` with the same clock reading; kept as a guard for clocks that
+            // move between the two reads.
             guard now < record.expiresAt else { receipt.rejected[copy.viewerID] = .shareExpired; continue }
             guard record.viewers.contains(copy.viewerID) else {
                 receipt.rejected[copy.viewerID] = .notARecipient
@@ -184,27 +231,29 @@ public actor LocationRelay {
             shares[copy.shareID] = record
 
             if let conns = connections[copy.viewerID], !conns.isEmpty {
-                for c in conns.values { c.yield(.point(copy)) }
+                for c in conns.values { c.points.yield(copy) }
                 receipt.deliveredLive.append(copy.viewerID)
             } else {
-                enqueuePush(copy)
+                enqueuePush(copy, now: now)
                 receipt.queuedForPush.append(copy.viewerID)
             }
         }
         return receipt
     }
 
-    private func enqueuePush(_ copy: SealedPoint) {
+    private func enqueuePush(_ copy: SealedPoint, now: Instant) {
         if let existing = pending[copy.viewerID]?[copy.shareID] {
-            pending[copy.viewerID]?[copy.shareID] = Pending(sealed: copy, coalesced: Saturating.add(existing.coalesced, 1))
+            pending[copy.viewerID]?[copy.shareID] = Pending(sealed: copy, coalesced: Saturating.add(existing.coalesced, 1),
+                                                            waitingSince: existing.waitingSince)
             pushesCoalesced = Saturating.add(pushesCoalesced, 1)
         } else {
-            pending[copy.viewerID, default: [:]][copy.shareID] = Pending(sealed: copy, coalesced: 0)
+            pending[copy.viewerID, default: [:]][copy.shareID] = Pending(sealed: copy, coalesced: 0, waitingSince: now)
         }
     }
 
-    /// Hands every pending push that has budget to the caller (the APNs sender). Pushes without budget
-    /// stay queued — coalesced to the newest point — until a token refills.
+    /// Hands every pending push that has budget to the caller (the APNs sender). Each viewer's queue is
+    /// served oldest-waiting first. Pushes without budget stay queued — coalesced to the newest point —
+    /// until a token refills.
     public func drainPushes() -> [PushDelivery] {
         let now = clock.now()
         var out: [PushDelivery] = []
@@ -212,8 +261,9 @@ public actor LocationRelay {
             guard let queue = pending[viewer] else { continue }
             var bucket = pushBudgets[viewer]
                 ?? TokenBucket(capacity: configuration.pushBurst, refillEvery: configuration.pushRefill, now: now)
-            for share in queue.keys.sorted(by: { $0.raw < $1.raw }) {
-                guard let item = queue[share], bucket.tryTake(now: now) else { break }
+            let order = queue.sorted { ($0.value.waitingSince, $0.key.raw) < ($1.value.waitingSince, $1.key.raw) }
+            for (share, item) in order {
+                guard bucket.tryTake(now: now) else { break }
                 out.append(PushDelivery(viewer: viewer, sealed: item.sealed, coalesced: item.coalesced))
                 pending[viewer]?[share] = nil
                 pushesSent = Saturating.add(pushesSent, 1)
@@ -226,35 +276,40 @@ public actor LocationRelay {
 
     // MARK: Foreground connections
 
-    /// Opens a foreground stream for `viewer` (the WebSocket path). The latest stored copy of every share
-    /// the viewer is on is replayed first, and anything queued for push is delivered here instead.
-    public func connect(_ viewer: ViewerID) -> AsyncStream<RelayEvent> {
-        let (stream, continuation) = AsyncStream.makeStream(
-            of: RelayEvent.self, bufferingPolicy: .bufferingNewest(configuration.connectionBuffer))
+    /// Opens a foreground connection for `viewer` (the WebSocket path). The latest stored copy of every
+    /// share the viewer is on is replayed first, and anything queued for push is delivered here instead.
+    /// A reconnecting viewer reconciles pins for shares that ended while it was away with `shares(for:)`.
+    public func connect(_ viewer: ViewerID) -> RelayConnection {
+        let (points, pointsCont) = AsyncStream.makeStream(
+            of: SealedPoint.self, bufferingPolicy: .bufferingNewest(configuration.connectionBuffer))
+        let (control, controlCont) = AsyncStream.makeStream(
+            of: ControlEvent.self, bufferingPolicy: .bufferingNewest(Self.controlBuffer))
         let id = UUID()
-        connections[viewer, default: [:]][id] = continuation
-        continuation.onTermination = { [weak self] _ in
-            Task { await self?.disconnect(viewer, id) }
-        }
-        for share in shares.keys.sorted(by: { $0.raw < $1.raw }) {
-            if let copy = latest[share]?[viewer] { continuation.yield(.point(copy)) }
+        connections[viewer, default: [:]][id] = Connection(points: pointsCont, control: controlCont)
+        // Terminating either stream (consumer cancelled or dropped) closes the connection.
+        pointsCont.onTermination = { [weak self] _ in Task { await self?.disconnect(viewer, id) } }
+        controlCont.onTermination = { [weak self] _ in Task { await self?.disconnect(viewer, id) } }
+        for share in (viewerShares[viewer] ?? []).sorted(by: { $0.raw < $1.raw }) {
+            if let copy = latest[share]?[viewer] { pointsCont.yield(copy) }
         }
         pending[viewer] = nil
-        return stream
+        return RelayConnection(points: points, control: control)
     }
 
     private func disconnect(_ viewer: ViewerID, _ id: UUID) {
-        connections[viewer]?[id] = nil
+        guard let conn = connections[viewer]?.removeValue(forKey: id) else { return }
+        conn.points.finish()
+        conn.control.finish()
         if connections[viewer]?.isEmpty == true { connections[viewer] = nil }
     }
 
     // MARK: Queries
 
     public func presence(of share: ShareID) -> Presence {
-        guard let record = shares[share], clock.now() < record.expiresAt else { return .unknownShare }
+        let now = clock.now()
+        guard let record = shares[share], now < record.expiresAt else { return .unknownShare }
         guard let seen = record.lastSeen else { return .awaitingFirstPoint }
-        return clock.now().elapsed(since: seen) <= configuration.presenceTTL
-            ? .online(lastSeen: seen) : .away(lastSeen: seen)
+        return now.elapsed(since: seen) <= configuration.presenceTTL ? .online(lastSeen: seen) : .away(lastSeen: seen)
     }
 
     public func latest(_ share: ShareID, for viewer: ViewerID) -> SealedPoint? { latest[share]?[viewer] }
@@ -263,12 +318,16 @@ public actor LocationRelay {
 
     public func viewers(of share: ShareID) -> Set<ViewerID> { shares[share]?.viewers ?? [] }
 
+    /// The shares a viewer is currently on.
+    public func shares(for viewer: ViewerID) -> Set<ShareID> { viewerShares[viewer] ?? [] }
+
     public var stats: RelayStats {
         RelayStats(activeShares: shares.count,
                    storedPoints: latest.values.reduce(0) { Saturating.add($0, $1.count) },
                    pendingPushes: pending.values.reduce(0) { Saturating.add($0, $1.count) },
                    liveConnections: connections.values.reduce(0) { Saturating.add($0, $1.count) },
-                   pushesSent: pushesSent, pushesCoalesced: pushesCoalesced)
+                   pushesSent: pushesSent, pushesCoalesced: pushesCoalesced,
+                   pushBudgets: pushBudgets.count)
     }
 
     // MARK: Internals
@@ -277,22 +336,27 @@ public actor LocationRelay {
         guard let record = shares.removeValue(forKey: id) else { return }
         latest[id] = nil
         for viewer in record.viewers {
-            pending[viewer]?[id] = nil
-            if pending[viewer]?.isEmpty == true { pending[viewer] = nil }
+            detach(viewer, from: id)
             send(.ended(id, reason), to: viewer)
-            dropBudgetIfIdle(viewer)
         }
     }
 
-    private func send(_ event: RelayEvent, to viewer: ViewerID) {
-        guard let conns = connections[viewer] else { return }
-        for c in conns.values { c.yield(event) }
+    /// Removes every per-(viewer, share) trace. A viewer left on no share loses their push budget entry,
+    /// which keeps `pushBudgets` bounded — and means a viewer added to a *new* share starts with a fresh
+    /// burst (documented in the README limits).
+    private func detach(_ viewer: ViewerID, from share: ShareID) {
+        latest[share]?[viewer] = nil
+        pending[viewer]?[share] = nil
+        if pending[viewer]?.isEmpty == true { pending[viewer] = nil }
+        viewerShares[viewer]?.remove(share)
+        if viewerShares[viewer]?.isEmpty == true {
+            viewerShares[viewer] = nil
+            pushBudgets[viewer] = nil
+        }
     }
 
-    /// Keeps `pushBudgets` bounded: a viewer on no share has no budget entry.
-    /// (Dropping it also resets their burst — acceptable, since a new share is a new conversation.)
-    private func dropBudgetIfIdle(_ viewer: ViewerID) {
-        guard !shares.values.contains(where: { $0.viewers.contains(viewer) }) else { return }
-        pushBudgets[viewer] = nil
+    private func send(_ event: ControlEvent, to viewer: ViewerID) {
+        guard let conns = connections[viewer] else { return }
+        for c in conns.values { c.control.yield(event) }
     }
 }

@@ -6,6 +6,8 @@ mutant at a time, runs only the test that claims to cover it, restores the file,
 if any mutant survives. Run from the package root: python3 Scripts/mutation_check.py
 """
 import pathlib
+import functools
+print = functools.partial(print, flush=True)  # noqa: A001 — stream progress in CI logs
 import subprocess
 import sys
 
@@ -22,17 +24,17 @@ MUTANTS = [
      "        pending[viewer]?[share] = nil",
      "RelayTests/testRevocationDeletesStoredCopyAndQueuedPushAndNotifies"),
     ("LocationRelay.swift",
-     "Pending(sealed: copy, coalesced: Saturating.add(existing.coalesced, 1))",
-     "Pending(sealed: existing.sealed, coalesced: Saturating.add(existing.coalesced, 1))",
+     "= Pending(sealed: copy, coalesced: Saturating.add(existing.coalesced, 1),",
+     "= Pending(sealed: existing.sealed, coalesced: Saturating.add(existing.coalesced, 1),",
      "RelayTests/testPushBudgetBurstsThenRefillsAndCoalescesToNewest"),
     ("LocationRelay.swift",
      "shares.filter { now >= $0.value.expiresAt }",
      "shares.filter { now > $0.value.expiresAt }",
      "RelayTests/testShareExpiresByTimeAndEverythingIsDeleted"),
     ("PublishPolicy.swift",
-     "let heartbeat = max(Millis.seconds(1), presenceTTL.dividedBy(2))",
-     "let heartbeat = max(Millis.seconds(1), presenceTTL)",
-     "PublishPolicyTests/testHeartbeatIsStrictlyShorterThanPresenceTTLForEveryCondition"),
+     "let heartbeat = max(minimumPresenceTTL, presenceTTL).dividedBy(2)",
+     "let heartbeat = max(minimumPresenceTTL, presenceTTL).dividedBy(2).times(2)",
+     "PublishPolicyTests/testHeartbeatIsAtMostHalfThePresenceTTLForEveryCondition"),
     ("PublishPolicy.swift",
      "        if elapsed >= cadence.heartbeatInterval { return .publish(.heartbeat) }\n",
      "",
@@ -49,6 +51,34 @@ MUTANTS = [
      "        sealer.revoke(viewer)\n",
      "",
      "SharerSessionTests/testRevokeDuringAnInFlightUploadStillExcludesTheViewer"),
+    ("SharerSession.swift",
+     "                outbox = copies.filter { current.contains($0.viewerID) }",
+     "                outbox = copies",
+     "SharerSessionTests/testRevokeDuringAFailingUploadNeverLeaksToTheRevokedViewer"),
+    ("SharerSession.swift",
+     "if receipt.shareIsGone { endLocally(); return .ended }\n            return .published(payload.reason",
+     "return .published(payload.reason",
+     "SharerSessionTests/testSessionStopsWhenTheRelayHasForgottenTheShare"),
+    ("SharerSession.swift",
+     "            toSend = good\n",
+     "",
+     "SharerSessionTests/testAHeartbeatOnAPoorFixResendsTheLastGoodFix"),
+    ("PublishPolicy.swift",
+     "        if fix.accuracyMeters > maxAccuracyMeters { return .suppress(.inaccurate) }\n        if elapsed < cadence.minInterval { return .suppress(.tooSoon) }",
+     "        if elapsed < cadence.minInterval { return .suppress(.tooSoon) }\n        if fix.accuracyMeters > maxAccuracyMeters { return .suppress(.inaccurate) }",
+     "PublishPolicyTests/testPoorAccuracyIsJudgedBeforeTimingAndMovement"),
+    ("FanoutCrypto.swift",
+     "guard let pinned = trustedSharers[sealed.shareID], pinned == sealed.sharerPublicKey",
+     "guard let pinned = Optional(sealed.sharerPublicKey)",
+     "FanoutCryptoTests/testRelayForgedKeyIsRejectedEvenWithAValidTag"),
+    ("FanoutCrypto.swift",
+     "        out.append(Data(repeating: 0x20, count: buckets * bucket - json.count))\n",
+     "",
+     "FanoutCryptoTests/testCiphertextLengthDoesNotRevealThePublishReason"),
+    ("LocationRelay.swift",
+     "let order = queue.sorted { ($0.value.waitingSince, $0.key.raw) < ($1.value.waitingSince, $1.key.raw) }",
+     "let order = queue.sorted { $0.key.raw < $1.key.raw }",
+     "RelayTests/testPushQueueIsServedOldestFirstSoABusyShareCannotStarveAQuietOne"),
     ("SharerSession.swift",
      "guard manifest.capabilities.contains(.liveLocationSharing) else { throw SessionError.capabilityNotDeclared }",
      "",
@@ -72,6 +102,12 @@ MUTANTS = [
 ]
 
 
+def compiles() -> bool:
+    """A mutant that does not compile proves nothing about the tests; treat it as a setup error."""
+    r = subprocess.run(["swift", "build", "--build-tests"], capture_output=True, text=True)
+    return r.returncode == 0
+
+
 def run(filter_: str) -> bool:
     """True if the filtered tests pass. A hang counts as a failure (the mutant was detected)."""
     try:
@@ -91,6 +127,9 @@ def main() -> int:
             return 2
         path.write_text(text.replace(original, mutant))
         try:
+            if not compiles():
+                print(f"SETUP ERROR: {name}: mutant does not compile: {mutant!r}")
+                return 2
             passed = run(test)
         finally:
             path.write_text(text)

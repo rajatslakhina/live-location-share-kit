@@ -47,15 +47,23 @@ final class FanoutCryptoTests: XCTestCase {
         return s
     }
 
+    /// A viewer that pinned `sealer`'s share key from the invitation.
+    func opener(_ keys: ViewerKeys, trusting sealer: PerViewerSealer) -> PerViewerOpener {
+        var o = PerViewerOpener(keys: keys)
+        o.trust(share, sharerPublicKey: sealer.sharePublicKey)
+        return o
+    }
+
     func testEachViewerDecryptsTheirOwnCopyAndOnlyThat() throws {
         let p = try payload()
-        let copies = try sealer([alice, bob]).sealCopies(p, sequence: 1)
+        let s = try sealer([alice, bob])
+        let copies = try s.sealCopies(p, sequence: 1)
         XCTAssertEqual(copies.map(\.viewerID), [alice.viewerID, bob.viewerID])
         guard copies.count == 2 else { return }
-        XCTAssertEqual(try PerViewerOpener(keys: alice).open(copies[0]), p)
-        XCTAssertEqual(try PerViewerOpener(keys: bob).open(copies[1]), p)
+        XCTAssertEqual(try opener(alice, trusting: s).open(copies[0]), p)
+        XCTAssertEqual(try opener(bob, trusting: s).open(copies[1]), p)
         XCTAssertNotEqual(copies[0].ciphertext, copies[1].ciphertext, "per-viewer keys, not one ciphertext fanned out")
-        XCTAssertThrowsError(try PerViewerOpener(keys: alice).open(copies[1])) {
+        XCTAssertThrowsError(try opener(alice, trusting: s).open(copies[1])) {
             XCTAssertEqual($0 as? FanoutCryptoError, .notAddressedToMe)
         }
     }
@@ -70,14 +78,16 @@ final class FanoutCryptoTests: XCTestCase {
     }
 
     func testRelayCannotReaddressRenumberOrTamper() throws {
-        let copies = try sealer([alice, bob]).sealCopies(try payload(), sequence: 7)
+        let s = try sealer([alice, bob])
+        let copies = try s.sealCopies(try payload(), sequence: 7)
         let forAlice = try XCTUnwrap(copies.first)
+        let aliceOpener = opener(alice, trusting: s)
         // Re-addressed to Bob: wrong key derivation and wrong associated data.
-        XCTAssertThrowsError(try PerViewerOpener(keys: bob).open(forAlice.readdressed(to: bob.viewerID)))
+        XCTAssertThrowsError(try opener(bob, trusting: s).open(forAlice.readdressed(to: bob.viewerID)))
         // Renumbered (to jump a replay window): the sequence is bound into the tag.
         let renumbered = SealedPoint(shareID: share, viewerID: alice.viewerID, sequence: 8,
                                      sharerPublicKey: forAlice.sharerPublicKey, ciphertext: forAlice.ciphertext)
-        XCTAssertThrowsError(try PerViewerOpener(keys: alice).open(renumbered)) {
+        XCTAssertThrowsError(try aliceOpener.open(renumbered)) {
             XCTAssertEqual($0 as? FanoutCryptoError, .authenticationFailed)
         }
         // A flipped byte.
@@ -86,12 +96,14 @@ final class FanoutCryptoTests: XCTestCase {
         bytes[20] ^= 0x01
         let tampered = SealedPoint(shareID: share, viewerID: alice.viewerID, sequence: 7,
                                    sharerPublicKey: forAlice.sharerPublicKey, ciphertext: Data(bytes))
-        XCTAssertThrowsError(try PerViewerOpener(keys: alice).open(tampered))
-        // A garbage sharer key.
+        XCTAssertThrowsError(try aliceOpener.open(tampered)) {
+            XCTAssertEqual($0 as? FanoutCryptoError, .authenticationFailed)
+        }
+        // A sharer key that is not the pinned one.
         let badKey = SealedPoint(shareID: share, viewerID: alice.viewerID, sequence: 7, sharerPublicKey: Data([1, 2, 3]),
                                  ciphertext: forAlice.ciphertext)
-        XCTAssertThrowsError(try PerViewerOpener(keys: alice).open(badKey)) {
-            XCTAssertEqual($0 as? FanoutCryptoError, .badSharerKey)
+        XCTAssertThrowsError(try aliceOpener.open(badKey)) {
+            XCTAssertEqual($0 as? FanoutCryptoError, .untrustedSharerKey)
         }
     }
 
@@ -100,6 +112,7 @@ final class FanoutCryptoTests: XCTestCase {
         let c3 = try XCTUnwrap(s.sealCopies(try payload(1, at: 3), sequence: 3).first)
         let c2 = try XCTUnwrap(s.sealCopies(try payload(2, at: 2), sequence: 2).first)
         var inbox = PointInbox(opener: PerViewerOpener(keys: alice))
+        inbox.trust(share, sharerPublicKey: s.sharePublicKey)
         XCTAssertEqual(try inbox.receive(c3).fix.latitude, 1)
         XCTAssertThrowsError(try inbox.receive(c3)) { XCTAssertEqual($0 as? FanoutCryptoError, .staleOrReplayed(sequence: 3, lastSeen: 3)) }
         XCTAssertThrowsError(try inbox.receive(c2)) { XCTAssertEqual($0 as? FanoutCryptoError, .staleOrReplayed(sequence: 2, lastSeen: 3)) }
@@ -112,14 +125,15 @@ final class FanoutCryptoTests: XCTestCase {
         s.revoke(carol.viewerID)
         let after = try s.sealCopies(try payload(at: 2_000), sequence: 2)
         XCTAssertEqual(after.map(\.viewerID), [alice.viewerID, bob.viewerID])
-        let openers: [any FanoutOpening] = [PerViewerOpener(keys: alice), PerViewerOpener(keys: bob), PerViewerOpener(keys: carol)]
+        let openers: [any FanoutOpening] = [alice, bob, carol].map { opener($0, trusting: s) }
         XCTAssertEqual(FanoutAudit.crossReadable(after, openers: openers), [], "Carol cannot read Alice's or Bob's copy, even re-addressed")
     }
 
     func testAuditPassesThePerViewerSchemeAndCatchesTheGroupKeyScheme() throws {
         let p = try payload()
-        let real = try sealer([alice, bob, carol]).sealCopies(p, sequence: 1)
-        let realOpeners: [any FanoutOpening] = [alice, bob, carol].map { PerViewerOpener(keys: $0) }
+        let realSealer = try sealer([alice, bob, carol])
+        let real = try realSealer.sealCopies(p, sequence: 1)
+        let realOpeners: [any FanoutOpening] = [alice, bob, carol].map { opener($0, trusting: realSealer) }
         XCTAssertEqual(FanoutAudit.crossReadable(real, openers: realOpeners), [])
 
         // The broken scheme, after "revoking" Carol by dropping her from the recipient list —
@@ -136,9 +150,70 @@ final class FanoutCryptoTests: XCTestCase {
     func testBadViewerKeyIsRejectedAtAddTime() {
         var s = PerViewerSealer(shareID: share)
         XCTAssertThrowsError(try s.add(ViewerID("x"), publicKey: Data(repeating: 0, count: 5))) {
-            XCTAssertEqual($0 as? FanoutCryptoError, .badSharerKey)
+            XCTAssertEqual($0 as? FanoutCryptoError, .badViewerKey)
+        }
+        // 32 bytes but a low-order point: the trial key agreement in `add` rejects it, so it can never
+        // break a later publish for everyone else.
+        XCTAssertThrowsError(try s.add(ViewerID("y"), publicKey: Data(repeating: 0, count: 32))) {
+            XCTAssertEqual($0 as? FanoutCryptoError, .badViewerKey)
         }
         XCTAssertEqual(s.recipients, [])
+    }
+
+    func testRelayForgedKeyIsRejectedEvenWithAValidTag() throws {
+        // The relay knows Alice's public key (it routes to her). It mints its own "share key" and seals a
+        // perfectly valid AEAD copy, at the highest possible sequence to lock out real updates.
+        let real = try sealer([alice])
+        var forger = PerViewerSealer(shareID: share)
+        try forger.add(alice.viewerID, publicKey: alice.publicKey)
+        let forged = try XCTUnwrap(forger.sealCopies(try payload(0), sequence: .max).first)
+        var inbox = PointInbox(opener: PerViewerOpener(keys: alice))
+        inbox.trust(share, sharerPublicKey: real.sharePublicKey)
+        XCTAssertThrowsError(try inbox.receive(forged)) { XCTAssertEqual($0 as? FanoutCryptoError, .untrustedSharerKey) }
+        // …and the real sharer's copy still gets through afterwards.
+        let genuine = try XCTUnwrap(real.sealCopies(try payload(), sequence: 1).first)
+        XCTAssertEqual(try inbox.receive(genuine).fix.latitude, 12.9716)
+        // Control: without pinning, the forged copy *would* decrypt — so the pin is what stops it.
+        var naive = PerViewerOpener(keys: alice)
+        naive.trust(share, sharerPublicKey: forged.sharerPublicKey)
+        XCTAssertNotNil(naive.tryOpen(forged))
+    }
+
+    func testOnlyTheViewersPrivateKeyOpensTheirCopy() throws {
+        // Same viewer ID, same pinned sharer key, fresh private key: a scheme that derived keys from public
+        // data alone would open this. Ours must not.
+        let s = try sealer([alice])
+        let copy = try XCTUnwrap(s.sealCopies(try payload(), sequence: 1).first)
+        let impostor = opener(ViewerKeys(viewerID: alice.viewerID), trusting: s)
+        XCTAssertThrowsError(try impostor.open(copy)) { XCTAssertEqual($0 as? FanoutCryptoError, .authenticationFailed) }
+    }
+
+    func testCiphertextLengthDoesNotRevealThePublishReason() throws {
+        let s = try sealer([alice])
+        let fix = try XCTUnwrap(LocationFix(latitude: 12.97, longitude: 77.59, accuracyMeters: 5, timestamp: Instant(millis: 1)))
+        let moved = try XCTUnwrap(s.sealCopies(PointPayload(fix: fix, sentAt: Instant(millis: 1), reason: .moved), sequence: 1).first)
+        let beat = try XCTUnwrap(s.sealCopies(PointPayload(fix: fix, sentAt: Instant(millis: 99_999_999), reason: .heartbeat), sequence: 2).first)
+        XCTAssertEqual(moved.ciphertext.count, beat.ciphertext.count)
+        // Control: the unpadded encodings differ in length, so equal ciphertexts are the padding's doing.
+        let rawMoved = try JSONEncoder().encode(PointPayload(fix: fix, sentAt: Instant(millis: 1), reason: .moved))
+        let rawBeat = try JSONEncoder().encode(PointPayload(fix: fix, sentAt: Instant(millis: 99_999_999), reason: .heartbeat))
+        XCTAssertNotEqual(rawMoved.count, rawBeat.count)
+    }
+
+    func testKeysSurviveARelaunch() throws {
+        let original = try sealer([alice])
+        var restored = try PerViewerSealer(shareID: share, privateKeyRaw: original.privateKeyRaw)
+        XCTAssertEqual(restored.sharePublicKey, original.sharePublicKey, "viewers' pins stay valid")
+        let restoredAlice = try ViewerKeys(viewerID: alice.viewerID, privateKeyRaw: alice.privateKeyRaw)
+        try restored.add(alice.viewerID, publicKey: restoredAlice.publicKey)
+        let copy = try XCTUnwrap(restored.sealCopies(try payload(), sequence: 2).first)
+        XCTAssertEqual(try opener(restoredAlice, trusting: original).open(copy).fix.latitude, 12.9716)
+        XCTAssertThrowsError(try PerViewerSealer(shareID: share, privateKeyRaw: Data([1]))) {
+            XCTAssertEqual($0 as? FanoutCryptoError, .badSharerKey)
+        }
+        XCTAssertThrowsError(try ViewerKeys(viewerID: alice.viewerID, privateKeyRaw: Data([1]))) {
+            XCTAssertEqual($0 as? FanoutCryptoError, .badViewerKey)
+        }
     }
 
     func testAssociatedDataIsInjective() {

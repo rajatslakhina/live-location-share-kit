@@ -62,16 +62,17 @@ final class SaturatingAndTimeTests: XCTestCase {
 final class PublishPolicyTests: XCTestCase {
     let ttl = Millis.seconds(120)
 
-    func testHeartbeatIsStrictlyShorterThanPresenceTTLForEveryCondition() {
+    func testHeartbeatIsAtMostHalfThePresenceTTLForEveryCondition() {
         for motion in MotionState.allCases {
             for battery in [0.0, 0.1, 0.3, 0.6, 1.0, .nan] {
                 for lowPower in [false, true] {
                     for ttl in [Millis(1), .seconds(1), .seconds(3), .seconds(120), .hours(1)] {
                         let c = PublishPolicy.cadence(for: DeviceConditions(batteryLevel: battery, isLowPowerMode: lowPower, motion: motion),
                                                       presenceTTL: ttl)
-                        if ttl >= .seconds(2) {
-                            XCTAssertLessThan(c.heartbeatInterval, ttl, "\(motion) \(battery) \(ttl)")
-                        }
+                        // TTLs below 2 s are clamped to 2 s, exactly as RelayConfiguration clamps them.
+                        let effective = max(PublishPolicy.minimumPresenceTTL, ttl)
+                        XCTAssertLessThanOrEqual(c.heartbeatInterval.value * 2, effective.value, "\(motion) \(battery) \(ttl)")
+                        XCTAssertEqual(RelayConfiguration(presenceTTL: ttl).presenceTTL, effective)
                         XCTAssertGreaterThanOrEqual(c.heartbeatInterval, .seconds(1))
                         XCTAssertLessThanOrEqual(c.minInterval, c.heartbeatInterval)
                     }
@@ -123,6 +124,14 @@ final class PublishPolicyTests: XCTestCase {
         XCTAssertEqual(gate.decide(fix(0.001, at: 20, accuracy: 500), now: Instant(millis: 20_000), cadence: walking), .suppress(.inaccurate))
         XCTAssertEqual(gate.decide(fix(0.001, at: 20), now: Instant(millis: 20_000), cadence: walking, discretionaryAllowed: false),
                        .suppress(.budgetExhausted))
+    }
+
+    func testPoorAccuracyIsJudgedBeforeTimingAndMovement() {
+        var gate = PublishGate()
+        gate.commit(fix(0, at: 0), at: Instant(millis: 0))
+        // Both "too soon" and "inaccurate" apply; the reason must be the accuracy one, so the counters tell
+        // an operator the GPS is bad rather than that the cadence is working.
+        XCTAssertEqual(gate.decide(fix(0.001, at: 5, accuracy: 500), now: Instant(millis: 5_000), cadence: walking), .suppress(.inaccurate))
     }
 
     func testHeartbeatBeatsBothBudgetAndPoorAccuracy() {

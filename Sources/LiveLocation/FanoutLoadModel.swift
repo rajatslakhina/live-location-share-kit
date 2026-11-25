@@ -27,12 +27,13 @@ public struct LoadAssumptions: Sendable, Hashable {
 
     static func nonNegative(_ d: Double) -> Double { d.isFinite && d > 0 ? d : 0 }
 
-    /// 1,000 active shares, 3 viewers each, a commuting-hour mix, 30 % of viewers foregrounded.
-    public static func reference(copyBytes: Int) -> LoadAssumptions {
-        LoadAssumptions(activeShares: 1_000, meanViewersPerShare: 3,
+    /// N active shares (1,000 by default), 3 viewers each, a commuting-hour mix, 30 % of viewers foregrounded.
+    public static func reference(copyBytes: Int, activeShares: Int = 1_000,
+                                 pushRefill: Millis = .minutes(5)) -> LoadAssumptions {
+        LoadAssumptions(activeShares: activeShares, meanViewersPerShare: 3,
                         motionMix: [.stationary: 0.55, .walking: 0.2, .cycling: 0.05, .driving: 0.2],
                         foregroundFraction: 0.3, copyBytes: copyBytes,
-                        presenceTTL: .seconds(120), pushRefill: .minutes(5))
+                        presenceTTL: .seconds(120), pushRefill: pushRefill)
     }
 }
 
@@ -51,6 +52,10 @@ public struct LoadEstimate: Sendable, Hashable {
     public let storedBytes: Int
     /// The same population publishing at a naive 1 Hz.
     public let naiveCopiesPerSecond: Double
+    /// Open foreground connections (WebSocket) the fleet must hold.
+    public let foregroundConnections: Double
+    /// Background viewers reachable only by push.
+    public let backgroundViewers: Double
 }
 
 /// Capacity per N active shares under `PublishPolicy` at full battery (the worst case for load: low
@@ -60,12 +65,9 @@ public enum FanoutLoadModel {
     public static func estimate(_ a: LoadAssumptions) -> LoadEstimate {
         let total = a.motionMix.values.reduce(0, +)
         let mix: [MotionState: Double] = total > 0 ? a.motionMix.mapValues { $0 / total } : [.unknown: 1]
-        let full = DeviceConditions(batteryLevel: 1, isCharging: true, motion: .unknown)
-
         var perSharerHz = 0.0
         for (state, share) in mix {
-            let c = PublishPolicy.cadence(for: DeviceConditions(batteryLevel: full.batteryLevel,
-                                                                isCharging: true, motion: state),
+            let c = PublishPolicy.cadence(for: DeviceConditions(batteryLevel: 1, isCharging: true, motion: state),
                                           presenceTTL: a.presenceTTL)
             // Stationary sharers send only heartbeats; moving ones send at their movement interval.
             let period = state == .stationary ? c.heartbeatInterval.seconds : c.minInterval.seconds
@@ -76,6 +78,7 @@ public enum FanoutLoadModel {
         let publishes = shares * perSharerHz
         let copies = publishes * a.meanViewersPerShare
         let socket = copies * a.foregroundFraction
+        let foregroundConnections = shares * a.meanViewersPerShare * a.foregroundFraction
         let backgroundViewers = shares * a.meanViewersPerShare * (1 - a.foregroundFraction)
         let perViewerPushHz = perSharerHz
         let budgetHz = 1 / max(0.001, a.pushRefill.seconds)
@@ -89,7 +92,9 @@ public enum FanoutLoadModel {
                             pushesPerHourBudgeted: finite(pushesBudgeted),
                             ingressBytesPerSecond: finite(copies * Double(a.copyBytes)),
                             storedBytes: max(0, stored),
-                            naiveCopiesPerSecond: finite(shares * a.meanViewersPerShare))
+                            naiveCopiesPerSecond: finite(shares * a.meanViewersPerShare),
+                            foregroundConnections: finite(foregroundConnections),
+                            backgroundViewers: finite(backgroundViewers))
     }
 
     private static func finite(_ d: Double) -> Double { d.isFinite ? d : 0 }

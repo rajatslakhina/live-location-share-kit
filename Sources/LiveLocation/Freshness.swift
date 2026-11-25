@@ -14,7 +14,7 @@ public enum Freshness: Hashable, Sendable {
         switch self {
         case .waiting: return "Waiting for first update"
         case .live: return "Live"
-        case .delayed(let a): return "Delayed · \(Int(a.seconds))s"
+        case .delayed(let a): return "Delayed · \(a.value / 1_000)s"
         case .stale(let a): return "Last seen \(Freshness.human(a)) ago"
         case .offline(let a): return a.map { "You're offline · last known \(Freshness.human($0)) ago" } ?? "You're offline"
         case .ended: return "Sharing ended"
