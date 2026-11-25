@@ -1,6 +1,12 @@
 # Changelog
 
-All tags were published on 25 Nov 2026. Seven independent review rounds drove the fixes. Use the latest.
+All tags were published on 25 Nov 2026. Eight independent review rounds drove the fixes, plus a verification review of 2.1.4. Use the latest.
+
+## 2.1.4
+- **Return values tell the truth in every interleaving.** `revoke` returns `true` whenever no relay work is left for the viewer (including when a later add was finally refused, or the share ended), and `addViewer` returns `true` only if the viewer is on the share, so a `revoke` that won while the add was in flight reports `false`.
+- **A failed upload that a newer, already-uploaded batch superseded returns `.idle`,** not `.heldOffline`, and is not counted as held. The `.heldOffline` and `.idle` docs now describe both `.idle` cases.
+- **Tests.** Three new tests with mutants (44 in all). Two tests whose race single-flight made impossible are renamed to what they check: calls made while one is in flight only update the intent and never reach the relay.
+- **Docs.** README limits regrouped (the failed-call assumption and the corrected-clock case are no longer under "no relay authentication"); CHANGELOG points 1.0.0 users at the latest release.
 
 ## 2.1.3
 - **Relay refusals are matched to the exact intent they answer.** Each `addViewer`/`revoke` gets its own intent epoch. In 2.1.2 a late refusal of an older add could still drop a viewer who had been revoked and re-added in the meantime, because the check compared intent values, not identity. Now only a refusal of the latest intent is final.
@@ -50,4 +56,4 @@ Re-releases the source-breaking fixes first tagged as 1.0.1–1.0.5 under a majo
 - **1.0.2–1.0.5.** Demo UI polish, plus removal of a redundant outbox filter that was masking a mutant.
 
 ## 1.0.0
-Initial release. Superseded: use 2.1.2 or later.
+Initial release. Superseded: use 2.1.4 or later.

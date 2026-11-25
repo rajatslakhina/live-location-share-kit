@@ -189,6 +189,18 @@ MUTANTS = [
      '                sealer.revoke(viewer)\n                outbox.removeAll { $0.viewerID == viewer }\n',
      '',
      'SharerSessionTests/testARelayRefusalOfAnAddIsPermanentNotRetried'),
+    ('SharerSession.swift',
+     '        _ = try? await reconcile(viewer)\n        return desiredOnRelay[viewer] == nil',
+     '        return (try? await reconcile(viewer)) ?? false',
+     'SharerSessionTests/testRevokeReportsDoneWhenALaterAddWasFinallyRefused'),
+    ('SharerSession.swift',
+     '        return acknowledged && sealer.recipients.contains(viewer)',
+     '        return acknowledged',
+     'SharerSessionTests/testAddViewerReportsFalseWhenARevokeWonWhileTheAddWasInFlight'),
+    ('SharerSession.swift',
+     '            } else if outbox.isEmpty {\n                return .idle                                     // a newer batch was already uploaded\n            }',
+     '            }',
+     'SharerSessionTests/testAFailedOlderUploadIsIdleWhenANewerBatchAlreadyUploaded'),
 ]
 
 

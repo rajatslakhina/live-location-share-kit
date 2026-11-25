@@ -362,7 +362,7 @@ final class SharerSessionTests: XCTestCase {
         await uplink.holdNextRevoke()
         let revoking = Task { await session.revoke(carol) }               // parked before reaching the relay
         while await uplink.revokeCalls < 1 { await Task.yield() }
-        try await session.addViewer(carol, publicKey: keys[2].publicKey)   // parks: the in-flight revoke's reconciler sends the add afterwards
+        try await session.addViewer(carol, publicKey: keys[2].publicKey)   // returns false at once; the in-flight revoke's reconciler sends the add afterwards
         await uplink.release()                                           // …then the revoke lands and removes her
         _ = await revoking.value
         let onShare = await relay.viewers(of: share).contains(carol)
@@ -433,19 +433,21 @@ final class SharerSessionTests: XCTestCase {
         XCTAssertEqual(r2.rejected, [:], "once the clock passes the junk, genuine copies win again")
     }
 
-    func testASlowReplyToAnOlderRevokeCannotClearANewerPendingRevoke() async throws {
+    func testCallsMadeWhileARevokeIsInFlightOnlyUpdateTheIntent() async throws {
         let (session, uplink, relay, clock) = try await setUp()
         let carol = ViewerID("c")
         _ = await session.ingest(fix(0, clock), conditions: walking)
         await uplink.holdAfterNextRevoke()
         let first = Task { await session.revoke(carol) }                 // #1 applied, reply delayed
         while await uplink.parkedCount < 1 { await Task.yield() }
-        try await session.addViewer(carol, publicKey: keys[2].publicKey)   // relay: back on
-        await uplink.setFailing(true)
-        _ = await session.revoke(carol)                                  // #2 fails: she is still on the relay
-        await uplink.setFailing(false)
+        let added = try await session.addViewer(carol, publicKey: keys[2].publicKey)  // returns false at once: only the intent changes
+        let revoked = await session.revoke(carol)                        // returns false at once, too
+        XCTAssertFalse(added)
+        XCTAssertFalse(revoked)
         await uplink.release()
-        _ = await first.value                                            // #1's stale "ok" arrives last
+        _ = await first.value                                            // #1's "ok" already matches the latest intent
+        let calls = await uplink.revokeCalls
+        XCTAssertEqual(calls, 1, "the inner calls never reached the relay")
         _ = await session.flushOutbox()
         let onShare = await relay.viewers(of: share).contains(carol)
         XCTAssertFalse(onShare, "the latest intent (revoked) reached the relay")
@@ -453,19 +455,21 @@ final class SharerSessionTests: XCTestCase {
         XCTAssertEqual(pending, [])
     }
 
-    func testASlowReplyToAnOlderAddCannotClearANewerPendingAdd() async throws {
+    func testCallsMadeWhileAnAddIsInFlightOnlyUpdateTheIntent() async throws {
         let (session, uplink, relay, clock) = try await setUp()
         let dana = ViewerKeys(viewerID: ViewerID("d"))
         _ = await session.ingest(fix(0, clock), conditions: walking)
         await uplink.holdAfterNextAdd()
         let first = Task { try await session.addViewer(dana.viewerID, publicKey: dana.publicKey) }  // #1 applied, reply delayed
         while await uplink.parkedCount < 1 { await Task.yield() }
-        _ = await session.revoke(dana.viewerID)                           // relay: off
-        await uplink.setFailing(true)
-        _ = try await session.addViewer(dana.viewerID, publicKey: dana.publicKey)  // #2 fails
-        await uplink.setFailing(false)
+        let revoked = await session.revoke(dana.viewerID)                // returns false at once: only the intent changes
+        let added = try await session.addViewer(dana.viewerID, publicKey: dana.publicKey)  // returns false at once, too
+        XCTAssertFalse(revoked)
+        XCTAssertFalse(added)
         await uplink.release()
-        _ = try await first.value                                        // #1's stale "ok" arrives last
+        _ = try await first.value                                        // #1's "ok" already matches the latest intent
+        let calls = await uplink.revokeCalls
+        XCTAssertEqual(calls, 0, "the inner revoke never reached the relay")
         _ = await session.flushOutbox()
         let onShare = await relay.viewers(of: share).contains(dana.viewerID)
         XCTAssertTrue(onShare, "the latest intent (added) reached the relay")
@@ -512,8 +516,8 @@ final class SharerSessionTests: XCTestCase {
         let first = Task { try await session.addViewer(erin.viewerID, publicKey: erin.publicKey) }  // refused (full), reply delayed
         while await uplink.parkedCount < 1 { await Task.yield() }
         _ = await session.revoke(keys[0].viewerID)                        // frees a slot at the relay
-        let off = await session.revoke(erin.viewerID)                     // parks behind #1
-        let again = try await session.addViewer(erin.viewerID, publicKey: erin.publicKey)  // parks too: "pending"
+        let off = await session.revoke(erin.viewerID)                     // returns false at once; #1's reconciler sends this intent afterwards
+        let again = try await session.addViewer(erin.viewerID, publicKey: erin.publicKey)  // returns false at once, too: "pending"
         XCTAssertFalse(off)
         XCTAssertFalse(again, "pending, not yet acknowledged")
         await uplink.release()                                           // #1's refusal arrives: it answers an old intent
@@ -543,6 +547,61 @@ final class SharerSessionTests: XCTestCase {
         XCTAssertEqual(pending, [])
         let recipients = await session.recipients
         XCTAssertFalse(recipients.contains(erin.viewerID))
+    }
+
+    func testRevokeReportsDoneWhenALaterAddWasFinallyRefused() async throws {
+        let (session, uplink, relay, _) = try await setUpFullShare()
+        let carol = keys[2]
+        await uplink.holdAfterNextRevoke()
+        let revoking = Task { await session.revoke(carol.viewerID) }      // applied at the relay, reply delayed
+        while await uplink.parkedCount < 1 { await Task.yield() }
+        try await relay.addViewer(ViewerID("e"), to: share)              // someone else takes the freed slot
+        let readd = try await session.addViewer(carol.viewerID, publicKey: carol.publicKey)
+        XCTAssertFalse(readd, "pending behind the in-flight revoke")
+        await uplink.release()                                           // the reconciler sends the add: refused (full)
+        let revoked = await revoking.value
+        XCTAssertTrue(revoked, "nothing is left to retry, so the revoke reports done")
+        let refused = await session.refusedAdds
+        XCTAssertEqual(refused, [carol.viewerID: .tooManyViewers(limit: 3)])
+        let pendingRevokes = await session.unacknowledgedRevocations
+        let pendingAdds = await session.unacknowledgedAdds
+        XCTAssertEqual(pendingRevokes, [])
+        XCTAssertEqual(pendingAdds, [])
+    }
+
+    func testAddViewerReportsFalseWhenARevokeWonWhileTheAddWasInFlight() async throws {
+        let (session, uplink, relay, _) = try await setUp()
+        let dana = ViewerKeys(viewerID: ViewerID("d"))
+        await uplink.holdAfterNextAdd()
+        let adding = Task { try await session.addViewer(dana.viewerID, publicKey: dana.publicKey) }  // applied, reply delayed
+        while await uplink.parkedCount < 1 { await Task.yield() }
+        _ = await session.revoke(dana.viewerID)                          // returns false at once; wins afterwards
+        await uplink.release()
+        let added = try await adding.value
+        XCTAssertFalse(added, "the relay acknowledged, but the latest intent removed her")
+        let onRelay = await relay.viewers(of: share).contains(dana.viewerID)
+        XCTAssertFalse(onRelay)
+    }
+
+    func testAFailedOlderUploadIsIdleWhenANewerBatchAlreadyUploaded() async throws {
+        let (session, uplink, _, clock) = try await setUp()
+        _ = await session.ingest(fix(0, clock), conditions: walking)
+        clock.advance(by: .seconds(20))
+        await uplink.holdNextUpload()
+        let olderFix = fix(0.001, clock), conditions = walking
+        let older = Task { await session.ingest(olderFix, conditions: conditions) }   // parked
+        while await uplink.uploads.count < 2 { await Task.yield() }
+        clock.advance(by: .seconds(61))
+        let newer = await session.ingest(fix(0.002, clock), conditions: walking)       // uploads fine
+        guard case .published = newer else { return XCTFail("\(newer)") }
+        await uplink.setFailing(true)
+        await uplink.release()                                           // the older one now fails
+        let olderOutcome = await older.value
+        XCTAssertEqual(olderOutcome, .idle, "nothing is held: the newer batch already reached the relay")
+        let held = await session.heldBatchRecipients
+        XCTAssertEqual(held, [])
+        let counted = await session.counters.heldOffline
+        XCTAssertEqual(counted, 0)
     }
 
     func testAnAddOverlappingStopThrowsShareEnded() async throws {

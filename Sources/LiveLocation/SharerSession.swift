@@ -36,10 +36,12 @@ public enum IngestOutcome: Sendable, Hashable {
     case suppressed(SuppressReason)
     /// Sealed and uploaded, but the relay accepted no copy (all stale, not a recipient, or future).
     case rejected(sequence: UInt64, receipt: PublishReceipt)
-    /// Sealed, but the uplink failed. The outbox holds one batch, latest wins: this one is kept unless a
-    /// newer batch is already held, which then supersedes it (location is latest-only anyway).
+    /// Sealed, but the uplink failed, and the batch is now held in the one-slot, latest-wins outbox (or
+    /// superseded there by a newer held batch). If a newer batch was already uploaded, or every viewer it
+    /// was for was revoked meanwhile, nothing is held and the result is `.idle` instead.
     case heldOffline(sequence: UInt64)
-    /// Nothing to send (no recipients left, or no prior fix to heartbeat).
+    /// Nothing to send (no recipients left, or no prior fix to heartbeat), or a failed batch that nothing
+    /// needs any more (see `heldOffline`).
     case idle
     /// The share is over (stopped locally, or the relay says it expired/was stopped). Nothing more is
     /// sealed or uploaded.
@@ -157,7 +159,8 @@ public actor SharerSession {
     /// Relay calls for one viewer are **single-flight**: at most one is in the air, and when it returns the
     /// session sends whatever the latest local intent is by then (on the share, or not), until the relay has
     /// acknowledged the latest intent. Calls made meanwhile only update the intent.
-    /// - Returns: whether the relay has acknowledged the latest intent for this viewer. `false` means it is
+    /// - Returns: whether the relay acknowledged and the viewer is on the share (a `revoke` made while the
+    ///   add was in flight wins, and then this is `false`). Otherwise `false` means it is
     ///   still pending (offline, or another call for this viewer is in flight); `flushOutbox` finishes it,
     ///   and a refusal met then is reported in `refusedAdds`.
     /// - Throws: `FanoutCryptoError.badViewerKey`; `SessionError.shareEnded` if the share ended before or
@@ -171,7 +174,7 @@ public actor SharerSession {
         setIntent(viewer, onShare: true)
         let acknowledged = try await reconcile(viewer)
         if isEnded { throw SessionError.shareEnded }                // stop() ran while the add was in flight
-        return acknowledged
+        return acknowledged && sealer.recipients.contains(viewer)
     }
 
     private func setIntent(_ viewer: ViewerID, onShare: Bool) {
@@ -279,13 +282,16 @@ public actor SharerSession {
     /// Revokes locally *first* — nothing new is sealed for `viewer` after this line, and the outbox drops
     /// them even if an in-flight upload fails back into it — then tells the relay to delete its copy.
     /// A batch already in flight may still arrive; the relay refuses it once its revocation lands.
-    /// - Returns: whether the relay acknowledged. If not, `flushOutbox` retries it.
+    /// - Returns: `true` when no relay work is pending for this viewer: the relay holds the latest intent,
+    ///   it finally refused a later add (see `refusedAdds`), or the share ended. `false` while a call is in
+    ///   flight or failed; `flushOutbox` finishes it.
     @discardableResult
     public func revoke(_ viewer: ViewerID) async -> Bool {
         sealer.revoke(viewer)
         outbox.removeAll { $0.viewerID == viewer }
         setIntent(viewer, onShare: false)
-        return (try? await reconcile(viewer)) ?? false
+        _ = try? await reconcile(viewer)
+        return desiredOnRelay[viewer] == nil
     }
 
     /// Ends the share: nothing more is sealed or uploaded, and the relay is asked to delete everything.
@@ -345,6 +351,8 @@ public actor SharerSession {
                 outboxSequence = seq
                 outboxReason = payload.reason
                 if outbox.isEmpty { return .idle }               // everyone it was for was revoked meanwhile
+            } else if outbox.isEmpty {
+                return .idle                                     // a newer batch was already uploaded
             }
             counters.heldOffline = Saturating.add(counters.heldOffline, 1)
             return .heldOffline(sequence: seq)
