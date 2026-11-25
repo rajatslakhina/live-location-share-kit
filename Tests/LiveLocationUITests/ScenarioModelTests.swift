@@ -23,7 +23,7 @@ final class ScenarioModelTests: XCTestCase {
         guard model.viewers.count == 3 else { return XCTFail("expected three viewers") }
         let alice = model.viewers[0], bob = model.viewers[1], carol = model.viewers[2]
         guard case .live = alice.freshness else { return XCTFail("Alice: \(alice.freshness)") }
-        guard case .behind = bob.freshness else { return XCTFail("Bob: \(bob.freshness)") }
+        XCTAssertEqual(bob.freshness.label, "Updated 6m ago · sharer online")
         XCTAssertEqual(carol.freshness, .ended)
         XCTAssertEqual(alice.received, ScenarioExpectations.uploaded, "Alice decrypted every point")
         XCTAssertNotNil(bob.latitude)
@@ -33,6 +33,17 @@ final class ScenarioModelTests: XCTestCase {
         XCTAssertEqual(bob.received, ScenarioExpectations.bobDecrypted)
         XCTAssertEqual(carol.received, ScenarioExpectations.carolDecrypted)
         XCTAssertEqual(model.budgetRemaining, ScenarioExpectations.budgetLeft)
+    }
+}
+
+@MainActor
+final class RefusedScenarioTests: XCTestCase {
+    func testAManifestWithoutTheCapabilityRunsNoShareAndSaysSo() async {
+        let model = ScenarioModel(manifest: CapabilityManifest(capabilities: []),
+                                  declaration: AgeRatingDeclaration(sharedLocation: false))
+        await model.runIfNeeded()
+        XCTAssertTrue(model.ranNoShare)
+        XCTAssertTrue(model.timeline.last?.text.contains("capabilityNotDeclared") ?? false)
     }
 }
 

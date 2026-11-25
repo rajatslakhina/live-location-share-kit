@@ -68,6 +68,23 @@ extension View {
     }
 }
 
+/// Shown when the scenario finished without running a share (e.g. the bundled manifest lacks the capability).
+struct RefusedCard: View {
+    let model: ScenarioModel
+    var body: some View {
+        Card(title: "No share ran") {
+            Text(model.timeline.last?.text ?? "The session was refused.").font(.callout)
+            Text("The app fails closed: without liveLocationSharing in its capability manifest, SharerSession refuses to start.")
+                .font(.footnote).foregroundStyle(.secondary)
+        }
+    }
+}
+
+extension ScenarioModel {
+    /// True when the run ended without a share (session refused or setup failed).
+    var ranNoShare: Bool { finished && counters.fixesSeen == 0 }
+}
+
 struct RunningPlaceholder: View {
     let running: Bool
     var body: some View {
@@ -90,6 +107,8 @@ struct SharerTab: View {
                 VStack(spacing: 12) {
                     if !model.finished {
                         RunningPlaceholder(running: model.isRunning)
+                    } else if model.ranNoShare {
+                        RefusedCard(model: model)
                     } else {
                         let c = model.counters
                         Card(title: "12 min: walk 3 → drive 4 → parked 5") {
@@ -179,6 +198,8 @@ struct ViewersTab: View {
                 VStack(spacing: 12) {
                     if !model.finished {
                         RunningPlaceholder(running: model.isRunning)
+                    } else if model.ranNoShare {
+                        RefusedCard(model: model)
                     } else {
                         map
                         ForEach(model.viewers) { v in viewerCard(v) }
@@ -255,6 +276,8 @@ struct CapacityTab: View {
                 VStack(spacing: 12) {
                     if model.finished && model.copyBytes > 0 {
                         content(FanoutLoadModel.estimate(.reference(copyBytes: model.copyBytes, pushRefill: model.pushRefill)))
+                    } else if model.ranNoShare {
+                        RefusedCard(model: model)
                     } else {
                         RunningPlaceholder(running: model.isRunning)
                     }

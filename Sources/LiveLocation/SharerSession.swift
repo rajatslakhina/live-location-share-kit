@@ -83,6 +83,7 @@ public actor SharerSession {
     private var outboxReason: PublishReason = .moved
     private var pendingRelayRevocations: Set<ViewerID> = []
     private var pendingRelayAdds: Set<ViewerID> = []
+    private var operationGeneration: [ViewerID: UInt64] = [:]
     /// Default mode: sequences follow the wall clock (see `send`). Off when the caller passes
     /// `startingSequence`, which gives a plain counter (tests, or apps that persist sequences).
     private let clockDrivenSequence: Bool
@@ -136,39 +137,72 @@ public actor SharerSession {
 
     /// Adds (or re-adds) a viewer. The key is validated first; nothing changes if it is bad. Then the next
     /// point is sealed for them, any pending revocation of them is cancelled, and the relay is told.
-    /// Relay operations for one viewer are reconciled after every `await`, so a revoke and an add that
-    /// interleave always converge to the latest local intent.
+    ///
+    /// Relay calls for one viewer carry a generation number. A reply to anything but the newest call is
+    /// stale: the session re-marks the *current* intent (on the share or not) as pending and re-sends it,
+    /// so replies arriving in any order converge to the latest local intent.
     /// - Returns: whether the relay acknowledged. If not, `flushOutbox` retries it (`unacknowledgedAdds`).
-    /// - Throws: `FanoutCryptoError.badViewerKey`, or `SessionError.shareEnded` after `stop()`.
+    /// - Throws: `FanoutCryptoError.badViewerKey`; `SessionError.shareEnded` after `stop()` or if the relay
+    ///   no longer knows the share; `RelayError.tooManyViewers` (the viewer is then removed locally too).
     @discardableResult
     public func addViewer(_ viewer: ViewerID, publicKey: Data) async throws -> Bool {
         guard !isEnded else { throw SessionError.shareEnded }
         try sealer.add(viewer, publicKey: publicKey)
         pendingRelayRevocations.remove(viewer)
         pendingRelayAdds.insert(viewer)
-        return await syncAdd(viewer)
+        return try await syncAdd(viewer)
     }
 
-    /// Sends a pending add and clears it only if the viewer is still a recipient afterwards.
-    private func syncAdd(_ viewer: ViewerID) async -> Bool {
-        let ok = (try? await uplink.addViewer(viewer, to: shareID)) != nil
-        if ok, sealer.recipients.contains(viewer) { pendingRelayAdds.remove(viewer) }
+    private func nextGeneration(_ viewer: ViewerID) -> UInt64 {
+        let g = (operationGeneration[viewer] ?? 0) &+ 1
+        operationGeneration[viewer] = g
+        return g
+    }
+
+    /// Sends the add. Transport failures leave it pending (`false`); a permanent refusal throws.
+    private func syncAdd(_ viewer: ViewerID) async throws -> Bool {
+        guard !isEnded else { pendingRelayAdds.remove(viewer); return false }
+        let generation = nextGeneration(viewer)
+        var ok = false
+        do {
+            try await uplink.addViewer(viewer, to: shareID)
+            ok = true
+        } catch let error as RelayError {
+            // The relay answered and said no: retrying cannot help.
+            pendingRelayAdds.remove(viewer)
+            if error == .unknownShare { endLocally(); throw SessionError.shareEnded }
+            sealer.revoke(viewer)
+            throw error
+        } catch {
+            ok = false                                     // transport failure: stays pending
+        }
+        guard operationGeneration[viewer] == generation else { await resendCurrentIntent(viewer); return ok }
+        if ok { pendingRelayAdds.remove(viewer) }
         return ok
     }
 
-    /// Sends a pending revoke and reconciles with any `addViewer` that ran during the `await`.
+    /// Sends the revoke; a failure leaves it pending.
     private func syncRevoke(_ viewer: ViewerID) async -> Bool {
+        let generation = nextGeneration(viewer)
         let ok = (try? await uplink.revoke(viewer, from: shareID)) != nil
+        guard operationGeneration[viewer] == generation else { await resendCurrentIntent(viewer); return ok }
+        if ok { pendingRelayRevocations.remove(viewer) }
+        return ok
+    }
+
+    /// A stale reply arrived: the relay may now reflect an older call. Mark the current intent pending
+    /// and send it again (it carries a newer generation).
+    private func resendCurrentIntent(_ viewer: ViewerID) async {
         if sealer.recipients.contains(viewer) {
-            // Re-added while the revoke was in flight: the relay may have applied the revoke *after* the
-            // add, so the add is re-sent.
+            guard !isEnded else { pendingRelayAdds.remove(viewer); return }
             pendingRelayRevocations.remove(viewer)
             pendingRelayAdds.insert(viewer)
-            _ = await syncAdd(viewer)
-        } else if ok {
-            pendingRelayRevocations.remove(viewer)
+            _ = try? await syncAdd(viewer)
+        } else {
+            pendingRelayAdds.remove(viewer)
+            pendingRelayRevocations.insert(viewer)
+            _ = await syncRevoke(viewer)
         }
-        return ok
     }
 
     /// Feeds one fix from CoreLocation (or a simulator route).
@@ -215,8 +249,8 @@ public actor SharerSession {
         for viewer in pendingRelayRevocations.sorted() where pendingRelayRevocations.contains(viewer) {
             _ = await syncRevoke(viewer)
         }
-        for viewer in pendingRelayAdds.sorted() where pendingRelayAdds.contains(viewer) {
-            if sealer.recipients.contains(viewer) { _ = await syncAdd(viewer) } else { pendingRelayAdds.remove(viewer) }
+        for viewer in pendingRelayAdds.sorted() where pendingRelayAdds.contains(viewer) && !isEnded {
+            if sealer.recipients.contains(viewer) { _ = try? await syncAdd(viewer) } else { pendingRelayAdds.remove(viewer) }
         }
         if pendingRelayStop, (try? await uplink.stop(shareID)) != nil { pendingRelayStop = false }
         guard !isEnded else { return .ended }
@@ -233,6 +267,7 @@ public actor SharerSession {
             return receipt.accepted ? .published(reason, sequence: seq, receipt: receipt)
                                     : .rejected(sequence: seq, receipt: receipt)
         } catch {
+            guard !isEnded else { return .ended }
             return .heldOffline(sequence: seq)
         }
     }

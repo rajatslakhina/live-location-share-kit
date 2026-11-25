@@ -2,7 +2,7 @@
 
 **"Design live location sharing", answered in Swift that compiles, runs and is tested.**
 
-> **TL;DR** In a 12-minute scripted share, 420 GPS fixes become 37 points. Each point goes out as one 365-byte end-to-end-encrypted copy per viewer, and the relay cannot read any of them. The repo includes 83 tests and 32 planted bugs, each of which a test must catch, plus a capacity estimate for 10 million concurrent shares. It ends with an honest list of what is *not* solved.
+> **TL;DR** In a 12-minute scripted share, 420 GPS fixes become 37 points. Each point goes out as one 365-byte end-to-end-encrypted copy per viewer, and the relay cannot read any of them. The repo includes 90 tests and 37 planted bugs, each of which a test must catch, plus a capacity estimate for 10 million concurrent shares. It ends with an honest list of what is *not* solved.
 
 The library covers six things:
 
@@ -18,7 +18,7 @@ The library covers six things:
 
 <img src="docs/viewers.png" width="300" align="right" alt="Demo app on the iOS Simulator. Alice's pin is live. Bob's pin is six minutes old because of his push budget, although the sharer is online. Carol has been revoked. The relay stores only ciphertext.">
 
-**Demo app:** [live-location-share-demo-app](https://github.com/rajatslakhina/live-location-share-demo-app) is a separate Xcode project that consumes this package as a remote Swift package. It requires a version from 2.1.0 up to, but not including, 3.0.0, and its `Package.resolved` pins the exact release. It runs a 12-minute scripted share (walk, then drive, then park) through the core types: session, sealer, relay, inbox, freshness, load model and gate. It was run on the iOS Simulator, and the screenshot comes from that run.
+**Demo app:** [live-location-share-demo-app](https://github.com/rajatslakhina/live-location-share-demo-app) is a separate Xcode project that consumes this package as a remote Swift package. It requires a version from 2.1.1 up to, but not including, 3.0.0, and its `Package.resolved` pins the exact release. It runs a 12-minute scripted share (walk, then drive, then park) through the core types: session, sealer, relay, inbox, freshness, load model and gate. It was run on the iOS Simulator, and the screenshot comes from that run.
 
 In the run, 420 GPS fixes became 37 points. Alice watches live over a socket. Bob is backgrounded, so his pin falls behind under the push budget. Carol is revoked halfway through.
 
@@ -63,16 +63,16 @@ VIEWER DEVICE
 
 | Layer | Type | Tested behaviour |
 |---|---|---|
-| Rate | `PublishPolicy`, `PublishGate` | Cadence follows motion: 5 s / 50 m when driving, down to 60 s / 100 m when parked, which in practice means heartbeats only. Battery and Low Power Mode stretch it 2× or 4×. **The heartbeat is at most half the presence TTL** for every TTL the relay accepts. Out-of-order, too-soon, not-moved and inaccurate fixes are suppressed, each with a reason. |
-| Battery | `TokenBucket` in `SharerSession` | A per-session budget of movement publishes. When it runs dry, the share falls back to heartbeats plus one movement update per refill. **Heartbeats never spend it.** The first point must be accurate, and a heartbeat that falls due on a poor fix re-sends the last good fix instead. |
-| Privacy | `PerViewerSealer`, `PerViewerOpener`, `PointInbox`, `FanoutAudit` | Each viewer's copy is sealed under its own key, and the plaintext is padded to a fixed size. The relay can read share, viewer and sequence, but never coordinates. Viewers accept only the sharer key they pinned from the invitation, so **a relay that mints its own key cannot forge a point**. Copies that are re-addressed, renumbered, tampered with or replayed are rejected. |
-| Revocation | `SharerSession.revoke`, `LocationRelay.revoke` | Enforced **on the sharer's device first**. Once `revoke` is called, nothing new is sealed for that key, and the offline outbox drops it, even if an in-flight upload fails back into it. A batch already in flight may still arrive, and the relay refuses it once its own revocation lands. Relay revokes, adds and `stop()` are retried by `flushOutbox` if they fail, and a revoke and a re-add that interleave always converge to the latest local intent. |
-| Server | `LocationRelay` (actor) | Stores only the latest copy per (share, viewer). Drops late copies by sequence, and drops impossible future ones (`futureSequence`). Presence uses a TTL. Shares end by time or by explicit stop, and viewers can be added mid-share. Share length, viewers per share, active shares and connections per viewer all have hard limits, and a viewer who leaves their last share is disconnected. |
-| Delivery | `connect(_:)`, `drainPushes()` | Foreground viewers get a newest-wins point stream **plus a separate control stream**, so a burst of points can never evict "remove this pin". Background viewers get pushes under a per-viewer budget. The queue is served oldest-waiting first, and a delayed push carries the newest point, not a backlog. |
-| Session | `SharerSession` (actor) | The share key can be persisted and sequences are epoch-based, so the session can be restored after a relaunch. It reads the presence TTL from the relay, so the two cannot disagree. It stops by itself when the relay reports the share gone, and supports `addViewer` and `stop()`. Sequences follow the wall clock, so a junk copy can block a share for at most 5 minutes plus clock skew. |
-| Viewer UI | `Freshness` | Live, behind, delayed, stale, waiting and ended, plus "*you* are offline" as its own state. A viewer whose copy is old while the sharer is online reads **behind**, not "last seen". "The sharer went quiet", "I am rate-limited" and "I have no network" never look the same. |
-| Capacity | `FanoutLoadModel` | For N active shares: publishes, sealed copies, socket connections and messages, pushes with and without the budget, bytes, and storage. |
-| Compliance | `CapabilityManifest`, `AgeRatingGate` | The manifest gates `SharerSession` at runtime. In the demo repo, CI runs the gate against the checked-in age-rating answer, including a control run that must fail. |
+| Rate | `PublishPolicy`, `PublishGate` | Motion sets the cadence: 5 s / 50 m when driving, 60 s when parked. Low battery stretches it 2× or 4×. The heartbeat is at most TTL / 2, and every suppressed fix records a reason. |
+| Battery | `TokenBucket` | A per-session budget for movement updates. Heartbeats never spend it. The first point must be accurate. |
+| Privacy | `PerViewerSealer`, `PointInbox`, `FanoutAudit` | One padded, sealed copy per viewer, under a sharer key the viewer pinned. The relay cannot read or forge points. Re-addressed, renumbered or replayed copies fail. |
+| Revocation | `SharerSession`, `LocationRelay` | Enforced on the sharer's device first. Relay-side revokes, adds and stops are retried. Out-of-order replies converge on the latest intent. |
+| Server | `LocationRelay` (actor) | Keeps only the latest copy per (share, viewer), with a presence TTL. Expiry, stop and hard limits apply. Future and stale sequences are dropped. A viewer who leaves their last share is disconnected. |
+| Delivery | `connect`, `drainPushes` | Newest-wins point stream plus a separate control stream. Pushes are budgeted, coalesced and served oldest first. |
+| Session | `SharerSession` (actor) | Reads the TTL from the relay. Sequences follow the clock, and the session can be restored after a relaunch. It stops when the share is gone. |
+| Viewer UI | `Freshness` | Live, behind, delayed, stale, waiting, ended, and "you are offline". |
+| Capacity | `FanoutLoadModel` | Publishes, copies, connections, pushes (with and without the budget), bytes and storage for N shares. |
+| Compliance | `CapabilityManifest`, `AgeRatingGate` | The manifest gates the session at runtime. Demo CI checks the manifest against the checked-in age-rating answer. |
 
 ## Design decisions and the alternatives I rejected
 
@@ -102,7 +102,7 @@ VIEWER DEVICE
 **A monotonic sequence, assigned before the upload `await`.**
 - In `ingest` and `tick`, `SharerSession` decides, spends budget, assigns the sequence, seals and commits, all before uploading. Two overlapping calls therefore get increasing sequences in call order, and if their uploads land out of order the relay drops the older one.
 - Sequences start at wall-clock ms × 2¹⁶, so a relaunched app is not mistaken for a replay, unless the device clock moved backwards.
-- Sequences also follow the clock: each one is at least wall-clock ms × 2¹⁶. The relay refuses sequences more than 5 minutes ahead of its own clock. A junk copy at `UInt64.max` is rejected outright, and one just inside the window blocks a share only until the sharer's clock passes it. Repeating it every few minutes still can; see the limits.
+- Sequences also follow the clock: each one is at least wall-clock ms × 2¹⁶. The relay refuses sequences more than 5 minutes ahead of its own clock. A junk copy at `UInt64.max` is rejected outright. In the default mode, one just inside the window blocks a share only until the sharer's clock passes it. Repeating it every few minutes still can; see the limits.
 - *Rejected:* server-assigned sequence numbers, which need a round trip before every publish and break offline buffering.
 - *Rejected:* ordering by fix timestamp, because CoreLocation re-delivers fixes and heartbeats re-send old ones.
 
@@ -133,8 +133,8 @@ VIEWER DEVICE
 | Sharer publishes | 675,000 / s |
 | Sealed copies accepted | 2,025,000 / s |
 | Ingress | ≈ 739 MB / s |
-| Open foreground connections | 9,000,000 |
-| Background viewers | 21,000,000 |
+| Foreground (share, viewer) pairs: upper bound on connections | 9,000,000 |
+| Background (share, viewer) pairs | 21,000,000 |
 | Pushes with a 5-minute budget | 252,000,000 / h (70,000 / s) |
 | Latest-only storage | ≈ 11 GB |
 
@@ -147,9 +147,9 @@ How that maps onto infrastructure (assumptions, not measurements):
 
 ## Verification
 
-- **Build and tests:** `swift build -Xswiftc -warnings-as-errors` from a clean `.build`, then `swift test`, locally on macOS with Xcode 27.2. **83 tests, 0 failures**: 82 library tests plus 1 test that pins the demo scenario.
+- **Build and tests:** `swift build -Xswiftc -warnings-as-errors` from a clean `.build`, then `swift test`, locally on macOS with Xcode 27.2. **90 tests, 0 failures**: 88 library tests plus 2 demo-scenario tests.
 - **iOS build:** `xcodebuild build` of both library targets for the iOS Simulator SDK, with warnings as errors.
-- **Mutation check:** `Scripts/mutation_check.py` plants 32 deliberate bugs, one at a time. Each mutant must compile, and its named test must **fail**. Each named test must also pass when no mutant is applied. Examples of the planted bugs:
+- **Mutation check:** `Scripts/mutation_check.py` plants 37 deliberate bugs, one at a time. Each mutant must compile, and its named test must **fail**. Each named test must also pass when no mutant is applied. Examples of the planted bugs:
   - accepting an equal sequence as new;
   - leaving the sharer-key pin unchecked;
   - dropping the future-sequence guard;
@@ -158,6 +158,7 @@ How that maps onto infrastructure (assumptions, not measurements):
   - not retrying a failed stop;
   - letting a stale revoke remove a re-added viewer;
   - letting a counter sequence fall behind a junk copy;
+  - letting a stale relay reply clear a newer pending revoke or add;
   - doubling the TTL / 2 heartbeat;
   - dropping the plaintext padding;
   - serving pushes by name instead of age.
@@ -169,7 +170,7 @@ To run the checks yourself:
 ```sh
 git clone https://github.com/rajatslakhina/live-location-share-kit.git && cd live-location-share-kit
 swift test
-python3 Scripts/mutation_check.py   # about 5–10 minutes; runs on a temporary copy of the package
+python3 Scripts/mutation_check.py   # about 6 minutes on an Apple-silicon Mac (measured: 339 s); runs on a temporary copy
 ```
 
 ## Honest limits
@@ -180,9 +181,9 @@ python3 Scripts/mutation_check.py   # about 5–10 minutes; runs on a temporary 
   - Anyone who can reach the relay can `connect` as another viewer's ID. That steals the viewer's future copies (still encrypted) and clears their queued pushes.
   - Anyone can keep presence alive by publishing.
   - Connections are capped per viewer (`maxConnectionsPerViewer`) and only allowed for viewers on a share, but without authentication anyone can use up a real viewer's connection slots.
-  - Anyone can publish a junk copy whose sequence sits up to 5 minutes ahead of now. That blocks genuine copies for that viewer for up to 5 minutes (plus clock skew), until the sharer's clock-driven sequence passes it. Re-posting it every few minutes keeps the share blocked indefinitely. Each junk copy also displaces a background viewer's pending push, so the viewer receives junk (which fails to decrypt) instead of the real point.
+  - Anyone can publish a junk copy whose sequence sits up to 5 minutes ahead of now. In the default clock-driven mode, that blocks genuine copies for that viewer for up to 5 minutes, plus clock skew, until the sharer's sequence passes it. With an explicit `startingSequence` (counter mode), it blocks that viewer for the rest of the session. Re-posting it every few minutes keeps the share blocked indefinitely. Each junk copy also displaces a background viewer's pending push, so the viewer receives junk (which fails to decrypt) instead of the real point.
   - Anyone who knows a `ShareID` can stop the share, revoke any viewer, or add viewers up to `maxViewersPerShare`. Anyone can start shares until `maxActiveShares` (global) is used up.
-  - The session's relay operations for one viewer converge only if the transport delivers them in the order they were issued; an HTTP client must serialise them per viewer.
+  - Relay revokes and adds for one viewer carry a generation number. Replies may arrive in any order and still converge, *provided* a call that failed was not later applied by the relay (for example, a timed-out request that is delivered late). An HTTP client should make these calls idempotent, or give them deadlines.
   - Mitigation in production: share-scoped publish tokens and authenticated sharer and viewer sessions.
 - **A sharer whose clock runs more than 5 minutes ahead of the relay's** has every copy rejected as `futureSequence`.
 
@@ -190,9 +191,9 @@ python3 Scripts/mutation_check.py   # about 5–10 minutes; runs on a temporary 
 - **Key distribution is out of scope.** The sharer's key travels with the invitation, and viewer keys come from the account system; both are assumed authentic. Production would add key transparency or safety-number verification.
 - **The relay still sees metadata:**
   - who shares with whom, when, and how often;
-  - the session's start time and publish count, from the epoch-based sequence;
+  - the sharer device's clock at every send, to the millisecond, from the clock-driven sequence;
   - coarse motion and battery state, from the publish cadence (5, 10, 15, 30 or 60 s intervals; 2× or 4× stretch).
-  Plaintext padding hides only the publish reason.
+  Padding removes the length signal, but heartbeats stay identifiable from their timing.
 - **No sender signature (key-compromise impersonation).** Static-static X25519 means that whoever steals a viewer's private key can also forge sharer points *to that viewer*. Signing each envelope with Ed25519, the rejected alternative above, would close this gap.
 - **Forward secrecy is limited.** There is one X25519 key per share, so compromising it exposes that share's copies. Compromising a viewer's long-term key exposes every share ever sent to that viewer.
 - **Viewer replay state lives in memory.** `PointInbox` rejects replays only within one app process.
@@ -214,7 +215,7 @@ python3 Scripts/mutation_check.py   # about 5–10 minutes; runs on a temporary 
 ## Use it
 
 ```swift
-.package(url: "https://github.com/rajatslakhina/live-location-share-kit.git", from: "2.1.0")
+.package(url: "https://github.com/rajatslakhina/live-location-share-kit.git", from: "2.1.1")
 ```
 
 **Sharer:**
@@ -276,7 +277,7 @@ Task { @MainActor in
 }
 ```
 
-**Versioning.** 2.0.0 re-releases, under a major version, the source-breaking changes first tagged as 1.0.1–1.0.5 on 25 Nov 2026. The full list is in the [2.0.0 release notes](https://github.com/rajatslakhina/live-location-share-kit/releases/tag/v2.0.0). 2.1.0 adds API (pending relay adds, connection caps, new error cases) and fixes from a fourth review; see its [release notes](https://github.com/rajatslakhina/live-location-share-kit/releases/tag/v2.1.0).
+Release history: [CHANGELOG.md](CHANGELOG.md).
 
 Products: `LiveLocation` (the core, no UI) and `LiveLocationUI` (the SwiftUI scenario the demo app shows). Requires iOS 17+ or macOS 14+, Swift 6 language mode.
 

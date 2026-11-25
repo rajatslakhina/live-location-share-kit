@@ -39,7 +39,7 @@ jobs:
   mutation:
     name: Mutation check (each guard must be caught by its test)
     runs-on: macos-15
-    timeout-minutes: 40
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v5
       - name: Apply each mutant, run its test, require a failure

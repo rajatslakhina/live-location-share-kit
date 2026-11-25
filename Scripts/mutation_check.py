@@ -14,10 +14,13 @@ import sys
 import shutil
 import tempfile
 
+import atexit
+
 ROOT = pathlib.Path(tempfile.mkdtemp(prefix="llk-mutants-"))
-# Work on a throwaway copy (including .build, for incremental builds) so an interrupted run can never
-# leave a mutant in the real working tree.
-shutil.copytree(".", ROOT, dirs_exist_ok=True, symlinks=True, ignore=shutil.ignore_patterns(".git"))
+atexit.register(shutil.rmtree, ROOT, ignore_errors=True)
+# Work on a throwaway copy so an interrupted run can never leave a mutant in the real working tree.
+# .build is not copied: its build database records absolute paths, so a copied one forces full rebuilds.
+shutil.copytree(".", ROOT, dirs_exist_ok=True, symlinks=True, ignore=shutil.ignore_patterns(".git", ".build"))
 SRC = ROOT / "Sources/LiveLocation"
 
 # (file, exact original text, mutant text, test filter that must fail)
@@ -55,8 +58,8 @@ MUTANTS = [
      ": now",
      "PublishPolicyTests/testBucketBurstThenExactRefill"),
     ("SharerSession.swift",
-     "        sealer.revoke(viewer)\n",
-     "",
+     "    public func revoke(_ viewer: ViewerID) async -> Bool {\n        sealer.revoke(viewer)\n",
+     "    public func revoke(_ viewer: ViewerID) async -> Bool {\n",
      "SharerSessionTests/testRevokeDuringAnInFlightUploadStillExcludesTheViewer"),
     ("SharerSession.swift",
      "                outbox = copies.filter { current.contains($0.viewerID) }",
@@ -115,11 +118,11 @@ MUTANTS = [
      "",
      "FreshnessTests/testAnOldCopyFromAnOnlineSharerIsBehindNotStale"),
     ("SharerSession.swift",
-     "            pendingRelayAdds.insert(viewer)\n            _ = await syncAdd(viewer)\n",
+     "            pendingRelayAdds.insert(viewer)\n            _ = try? await syncAdd(viewer)\n",
      "",
      "SharerSessionTests/testAReAddDuringASuccessfulRevokeEndsWithTheViewerOnTheRelay"),
     ("SharerSession.swift",
-     "            if sealer.recipients.contains(viewer) { _ = await syncAdd(viewer) } else { pendingRelayAdds.remove(viewer) }",
+     "            if sealer.recipients.contains(viewer) { _ = try? await syncAdd(viewer) } else { pendingRelayAdds.remove(viewer) }",
      "            pendingRelayAdds.remove(viewer)",
      "SharerSessionTests/testAnOfflineAddOfANewViewerIsRetriedByFlush"),
     ("SharerSession.swift",
@@ -146,6 +149,26 @@ MUTANTS = [
      "guard viewerShares[viewer]?.isEmpty == false else { throw RelayError.notAViewer }",
      "guard true else { throw RelayError.notAViewer }",
      "RelayTests/testConnectRefusesStrangersAndCapsConnectionsPerViewer"),
+    ("SharerSession.swift",
+     "        guard operationGeneration[viewer] == generation else { await resendCurrentIntent(viewer); return ok }\n        if ok { pendingRelayRevocations.remove(viewer) }",
+     "        if ok { pendingRelayRevocations.remove(viewer) }",
+     "SharerSessionTests/testASlowReplyToAnOlderRevokeCannotClearANewerPendingRevoke"),
+    ("SharerSession.swift",
+     "        guard operationGeneration[viewer] == generation else { await resendCurrentIntent(viewer); return ok }\n        if ok { pendingRelayAdds.remove(viewer) }",
+     "        if ok { pendingRelayAdds.remove(viewer) }",
+     "SharerSessionTests/testASlowReplyToAnOlderAddCannotClearANewerPendingAdd"),
+    ("SharerSession.swift",
+     "            sealer.revoke(viewer)\n            throw error",
+     "            throw error",
+     "SharerSessionTests/testARelayRefusalOfAnAddIsPermanentNotRetried"),
+    ("SharerSession.swift",
+     "        } catch {\n            guard !isEnded else { return .ended }\n            return .heldOffline(sequence: seq)",
+     "        } catch {\n            return .heldOffline(sequence: seq)",
+     "SharerSessionTests/testFlushReturnsEndedWhenStopRunsDuringAFailedUpload"),
+    ("SharerSession.swift",
+     "            guard !isEnded else { return .ended }                            // stop() ran during the upload\n            if receipt.shareIsGone",
+     "            if receipt.shareIsGone",
+     "SharerSessionTests/testFlushReturnsEndedWhenStopRunsDuringASuccessfulUpload"),
     ("AgeRatingGate.swift",
      "case (true, false): return [.undeclaredSharedLocation]",
      "case (true, false): return []",

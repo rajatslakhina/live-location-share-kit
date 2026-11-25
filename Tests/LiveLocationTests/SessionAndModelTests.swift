@@ -8,7 +8,10 @@ actor GatedUplink: RelayUplink {
     nonisolated var presenceTTL: Millis { relay.configuration.presenceTTL }
     private var holdNext = false
     private var holdNextRevokeCall = false
+    private var holdAfterNextRevokeCall = false
+    private var holdAfterNextAddCall = false
     private(set) var revokeCalls = 0
+    var parkedCount: Int { parked.count }
     private var parked: [CheckedContinuation<Void, Never>] = []
     private(set) var uploads: [[SealedPoint]] = []
     var failing = false
@@ -16,6 +19,10 @@ actor GatedUplink: RelayUplink {
     init(relay: LocationRelay) { self.relay = relay }
     func holdNextUpload() { holdNext = true }
     func holdNextRevoke() { holdNextRevokeCall = true }
+    /// Park the next revoke *after* the relay applied it: a slow reply.
+    func holdAfterNextRevoke() { holdAfterNextRevokeCall = true }
+    /// Park the next add *after* the relay applied it: a slow reply.
+    func holdAfterNextAdd() { holdAfterNextAddCall = true }
     func setFailing(_ f: Bool) { failing = f }
     func release() { parked.forEach { $0.resume() }; parked = [] }
 
@@ -37,6 +44,10 @@ actor GatedUplink: RelayUplink {
         }
         if failing { throw URLError(.notConnectedToInternet) }
         await relay.revoke(viewer, from: share)
+        if holdAfterNextRevokeCall {
+            holdAfterNextRevokeCall = false
+            await withCheckedContinuation { parked.append($0) }
+        }
     }
 
     func stop(_ share: ShareID) async throws {
@@ -47,6 +58,10 @@ actor GatedUplink: RelayUplink {
     func addViewer(_ viewer: ViewerID, to share: ShareID) async throws {
         if failing { throw URLError(.notConnectedToInternet) }
         try await relay.addViewer(viewer, to: share)
+        if holdAfterNextAddCall {
+            holdAfterNextAddCall = false
+            await withCheckedContinuation { parked.append($0) }
+        }
     }
 }
 
@@ -101,6 +116,9 @@ final class SharerSessionTests: XCTestCase {
         XCTAssertEqual(Set(receipt.rejected.values), [.staleSequence], "the late upload is dropped by the relay")
         let stored = await relay.latest(share, for: ViewerID("a"))?.sequence
         XCTAssertEqual(stored, fastSeq)
+        let counters = await session.counters
+        XCTAssertEqual(counters.uploaded, 2, "the rejected late batch is sealed but not counted as uploaded")
+        XCTAssertEqual(counters.sealed, 3)
     }
 
     func testRevokeDuringAnInFlightUploadStillExcludesTheViewer() async throws {
@@ -303,7 +321,7 @@ final class SharerSessionTests: XCTestCase {
     }
 
     func testAViewerReAddedWhileTheirRevokeIsInFlightIsNotQueuedForRevocation() async throws {
-        let (session, uplink, relay, clock) = try await setUp()
+        let (session, uplink, _, clock) = try await setUp()
         let carol = ViewerID("c")
         _ = await session.ingest(fix(0, clock), conditions: walking)
         await uplink.holdNextRevoke()
@@ -318,8 +336,8 @@ final class SharerSessionTests: XCTestCase {
         XCTAssertEqual(pending, [], "…but she was re-added meanwhile, so nothing is queued to revoke her")
         await uplink.setFailing(false)
         _ = await session.flushOutbox()
-        let onShare = await relay.viewers(of: share).contains(carol)
-        XCTAssertTrue(onShare)
+        let addsAfter = await session.unacknowledgedAdds
+        XCTAssertEqual(addsAfter, [], "the re-sent add was acknowledged")
     }
 
     func testAReAddDuringASuccessfulRevokeEndsWithTheViewerOnTheRelay() async throws {
@@ -398,6 +416,107 @@ final class SharerSessionTests: XCTestCase {
         let unblocked = await session.tick(conditions: walking)
         guard case .published(_, _, let r2) = unblocked else { return XCTFail("\(unblocked)") }
         XCTAssertEqual(r2.rejected, [:], "once the clock passes the junk, genuine copies win again")
+    }
+
+    func testASlowReplyToAnOlderRevokeCannotClearANewerPendingRevoke() async throws {
+        let (session, uplink, relay, clock) = try await setUp()
+        let carol = ViewerID("c")
+        _ = await session.ingest(fix(0, clock), conditions: walking)
+        await uplink.holdAfterNextRevoke()
+        let first = Task { await session.revoke(carol) }                 // #1 applied, reply delayed
+        while await uplink.parkedCount < 1 { await Task.yield() }
+        try await session.addViewer(carol, publicKey: keys[2].publicKey)   // relay: back on
+        await uplink.setFailing(true)
+        _ = await session.revoke(carol)                                  // #2 fails: she is still on the relay
+        await uplink.setFailing(false)
+        await uplink.release()
+        _ = await first.value                                            // #1's stale "ok" arrives last
+        _ = await session.flushOutbox()
+        let onShare = await relay.viewers(of: share).contains(carol)
+        XCTAssertFalse(onShare, "the latest intent (revoked) reached the relay")
+        let pending = await session.unacknowledgedRevocations
+        XCTAssertEqual(pending, [])
+    }
+
+    func testASlowReplyToAnOlderAddCannotClearANewerPendingAdd() async throws {
+        let (session, uplink, relay, clock) = try await setUp()
+        let dana = ViewerKeys(viewerID: ViewerID("d"))
+        _ = await session.ingest(fix(0, clock), conditions: walking)
+        await uplink.holdAfterNextAdd()
+        let first = Task { try await session.addViewer(dana.viewerID, publicKey: dana.publicKey) }  // #1 applied, reply delayed
+        while await uplink.parkedCount < 1 { await Task.yield() }
+        _ = await session.revoke(dana.viewerID)                           // relay: off
+        await uplink.setFailing(true)
+        _ = try await session.addViewer(dana.viewerID, publicKey: dana.publicKey)  // #2 fails
+        await uplink.setFailing(false)
+        await uplink.release()
+        _ = try await first.value                                        // #1's stale "ok" arrives last
+        _ = await session.flushOutbox()
+        let onShare = await relay.viewers(of: share).contains(dana.viewerID)
+        XCTAssertTrue(onShare, "the latest intent (added) reached the relay")
+        let pending = await session.unacknowledgedAdds
+        XCTAssertEqual(pending, [])
+    }
+
+    func testARelayRefusalOfAnAddIsPermanentNotRetried() async throws {
+        let clock = ManualClock(start: Instant(millis: 1_000_000))
+        let relay = LocationRelay(configuration: RelayConfiguration(maxViewersPerShare: 3), clock: clock)
+        try await relay.startShare(share, viewers: Set(keys.map(\.viewerID)), duration: .hours(1))
+        var sealer = PerViewerSealer(shareID: share)
+        for k in keys { try sealer.add(k.viewerID, publicKey: k.publicKey) }
+        let session = try SharerSession(shareID: share, manifest: manifest, sealer: sealer, uplink: relay, clock: clock)
+        let extra = ViewerKeys(viewerID: ViewerID("e"))
+        do {
+            try await session.addViewer(extra.viewerID, publicKey: extra.publicKey)
+            XCTFail("expected tooManyViewers")
+        } catch {
+            XCTAssertEqual(error as? RelayError, .tooManyViewers(limit: 3))
+        }
+        let recipients = await session.recipients
+        XCTAssertFalse(recipients.contains(extra.viewerID), "not sealed for a viewer the relay refused")
+        let pending = await session.unacknowledgedAdds
+        XCTAssertEqual(pending, [], "and not retried forever")
+    }
+
+    func flushWithStopDuringUpload(uploadSucceeds: Bool) async throws -> IngestOutcome {
+        let (session, uplink, _, clock) = try await setUp()
+        await uplink.setFailing(true)
+        _ = await session.ingest(fix(0, clock), conditions: walking)     // held offline
+        await uplink.setFailing(false)
+        await uplink.holdNextUpload()
+        let flushing = Task { await session.flushOutbox() }
+        while await uplink.uploads.count < 2 { await Task.yield() }
+        await uplink.setFailing(true)
+        _ = await session.stop()                                         // runs at the flush's await
+        await uplink.setFailing(!uploadSucceeds)
+        await uplink.release()
+        return await flushing.value
+    }
+
+    func testFlushReturnsEndedWhenStopRunsDuringASuccessfulUpload() async throws {
+        let outcome = try await flushWithStopDuringUpload(uploadSucceeds: true)
+        XCTAssertEqual(outcome, .ended)
+    }
+
+    func testFlushReturnsEndedWhenStopRunsDuringAFailedUpload() async throws {
+        let outcome = try await flushWithStopDuringUpload(uploadSucceeds: false)
+        XCTAssertEqual(outcome, .ended, "not .heldOffline: the outbox was already cleared by stop()")
+    }
+
+    func testAFailedSealDoesNotResetTheHeartbeatClock() async throws {
+        let (session, _, relay, clock) = try await setUp()
+        _ = await session.ingest(fix(0, clock), conditions: walking)     // committed at t0
+        for k in keys { _ = await session.revoke(k.viewerID) }           // nobody to seal for
+        clock.advance(by: .seconds(61))
+        let nobody = await session.tick(conditions: walking)
+        XCTAssertEqual(nobody, .idle, "nothing sealed")
+        try await relay.addViewer(keys[0].viewerID, to: share)
+        try await session.addViewer(keys[0].viewerID, publicKey: keys[0].publicKey)
+        clock.advance(by: .seconds(1))
+        let beat = await session.tick(conditions: walking)
+        guard case .published(.heartbeat, _, _) = beat else {
+            return XCTFail("the heartbeat is still owed from t0, so the empty seal did not commit: \(beat)")
+        }
     }
 
     func testStopDuringAFailingUploadNeverRefillsTheOutbox() async throws {

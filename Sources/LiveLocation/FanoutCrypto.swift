@@ -91,7 +91,8 @@ enum AssociatedData {
 }
 
 /// Fixed-size plaintext. Without padding the ciphertext length leaks the publish reason (the JSON for
-/// "heartbeat" is longer than for "moved"), which would tell the relay when the sharer is parked.
+/// "heartbeat" is longer than for "moved"). Padding removes that length signal only: heartbeats stay
+/// identifiable from timing (they arrive TTL / 2 after the previous publish).
 /// JSON tolerates trailing whitespace, so padding with spaces needs no framing.
 enum Plaintext {
     static let bucket = 256
