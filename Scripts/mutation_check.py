@@ -146,8 +146,8 @@ MUTANTS = [
      'guard true else { throw RelayError.notAViewer }',
      'RelayTests/testConnectRefusesStrangersAndCapsConnectionsPerViewer'),
     ('SharerSession.swift',
-     '        } catch {\n            guard !isEnded else { return .ended }\n            return .heldOffline(sequence: seq)',
-     '        } catch {\n            return .heldOffline(sequence: seq)',
+     '        } catch {\n            guard !isEnded else { return .ended }\n            // Nothing held',
+     '        } catch {\n            // Nothing held',
      'SharerSessionTests/testFlushReturnsEndedWhenStopRunsDuringAFailedUpload'),
     ('SharerSession.swift',
      '            guard !isEnded else { return .ended }                            // stop() ran during the upload\n            if receipt.shareIsGone',
@@ -201,6 +201,10 @@ MUTANTS = [
      '            } else if outbox.isEmpty {\n                return .idle                                     // a newer batch was already uploaded\n            }',
      '            }',
      'SharerSessionTests/testAFailedOlderUploadIsIdleWhenANewerBatchAlreadyUploaded'),
+    ('SharerSession.swift',
+     'return outbox.isEmpty ? .idle : .heldOffline(sequence: seq)',
+     'return .heldOffline(sequence: seq)',
+     'SharerSessionTests/testAFailedFlushIsIdleWhenANewerBatchUploadedMeanwhile'),
 ]
 
 

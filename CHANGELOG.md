@@ -1,9 +1,13 @@
 # Changelog
 
-All tags were published on 25 Nov 2026. Eight independent review rounds drove the fixes, plus a verification review of 2.1.4. Use the latest.
+All tags were published on 25 Nov 2026. Eight independent review rounds drove the fixes, plus verification reviews of 2.1.4 and 2.1.5. Use the latest.
+
+## 2.1.5
+- **`flushOutbox` also returns `.idle` when nothing is held** — when a newer batch uploaded while its retry was in flight, or a revoke emptied the outbox — instead of `.heldOffline`. 2.1.4 fixed this only for `ingest`/`tick`.
+- **Tests.** One new test with its mutant (45 in all). The two "calls made while one is in flight" tests now also count relay add calls, so both halves of their claim are checked.
 
 ## 2.1.4
-- **Return values tell the truth in every interleaving.** `revoke` returns `true` whenever no relay work is left for the viewer (including when a later add was finally refused, or the share ended), and `addViewer` returns `true` only if the viewer is on the share, so a `revoke` that won while the add was in flight reports `false`.
+- **Return values tell the truth in the interleavings round 8 found.** `revoke` returns `true` whenever no relay work is left for the viewer (including when a later add was finally refused, or the share ended), and `addViewer` returns `true` only if the viewer is on the share, so a `revoke` that won while the add was in flight reports `false`.
 - **A failed upload that a newer, already-uploaded batch superseded returns `.idle`,** not `.heldOffline`, and is not counted as held. The `.heldOffline` and `.idle` docs now describe both `.idle` cases.
 - **Tests.** Three new tests with mutants (44 in all). Two tests whose race single-flight made impossible are renamed to what they check: calls made while one is in flight only update the intent and never reach the relay.
 - **Docs.** README limits regrouped (the failed-call assumption and the corrected-clock case are no longer under "no relay authentication"); CHANGELOG points 1.0.0 users at the latest release.
@@ -56,4 +60,4 @@ Re-releases the source-breaking fixes first tagged as 1.0.1–1.0.5 under a majo
 - **1.0.2–1.0.5.** Demo UI polish, plus removal of a redundant outbox filter that was masking a mutant.
 
 ## 1.0.0
-Initial release. Superseded: use 2.1.4 or later.
+Initial release. Superseded: use 2.1.5 or later.

@@ -11,6 +11,7 @@ actor GatedUplink: RelayUplink {
     private var holdAfterNextRevokeCall = false
     private var holdAfterNextAddCall = false
     private(set) var revokeCalls = 0
+    private(set) var addCalls = 0
     var parkedCount: Int { parked.count }
     private var parked: [CheckedContinuation<Void, Never>] = []
     private(set) var uploads: [[SealedPoint]] = []
@@ -61,6 +62,7 @@ actor GatedUplink: RelayUplink {
     }
 
     func addViewer(_ viewer: ViewerID, to share: ShareID) async throws {
+        addCalls += 1
         if failing { throw URLError(.notConnectedToInternet) }
         do {
             try await relay.addViewer(viewer, to: share)
@@ -447,7 +449,9 @@ final class SharerSessionTests: XCTestCase {
         await uplink.release()
         _ = await first.value                                            // #1's "ok" already matches the latest intent
         let calls = await uplink.revokeCalls
-        XCTAssertEqual(calls, 1, "the inner calls never reached the relay")
+        XCTAssertEqual(calls, 1, "the inner revoke never reached the relay")
+        let adds = await uplink.addCalls
+        XCTAssertEqual(adds, 0, "nor did the inner add: #1's ok already matched the latest intent")
         _ = await session.flushOutbox()
         let onShare = await relay.viewers(of: share).contains(carol)
         XCTAssertFalse(onShare, "the latest intent (revoked) reached the relay")
@@ -470,6 +474,8 @@ final class SharerSessionTests: XCTestCase {
         _ = try await first.value                                        // #1's "ok" already matches the latest intent
         let calls = await uplink.revokeCalls
         XCTAssertEqual(calls, 0, "the inner revoke never reached the relay")
+        let adds = await uplink.addCalls
+        XCTAssertEqual(adds, 1, "nor did the inner add: only #1 was sent")
         _ = await session.flushOutbox()
         let onShare = await relay.viewers(of: share).contains(dana.viewerID)
         XCTAssertTrue(onShare, "the latest intent (added) reached the relay")
@@ -602,6 +608,25 @@ final class SharerSessionTests: XCTestCase {
         XCTAssertEqual(held, [])
         let counted = await session.counters.heldOffline
         XCTAssertEqual(counted, 0)
+    }
+
+    func testAFailedFlushIsIdleWhenANewerBatchUploadedMeanwhile() async throws {
+        let (session, uplink, _, clock) = try await setUp()
+        await uplink.setFailing(true)
+        _ = await session.ingest(fix(0, clock), conditions: walking)     // held offline
+        await uplink.setFailing(false)
+        await uplink.holdNextUpload()
+        let flushing = Task { await session.flushOutbox() }              // parked
+        while await uplink.uploads.count < 2 { await Task.yield() }
+        clock.advance(by: .seconds(61))
+        let newer = await session.ingest(fix(0.002, clock), conditions: walking)       // uploads fine
+        guard case .published = newer else { return XCTFail("\(newer)") }
+        await uplink.setFailing(true)
+        await uplink.release()                                           // the flush's upload now fails
+        let outcome = await flushing.value
+        XCTAssertEqual(outcome, .idle, "nothing is held: the newer batch already reached the relay")
+        let held = await session.heldBatchRecipients
+        XCTAssertEqual(held, [])
     }
 
     func testAnAddOverlappingStopThrowsShareEnded() async throws {

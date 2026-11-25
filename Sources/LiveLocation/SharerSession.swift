@@ -275,7 +275,8 @@ public actor SharerSession {
                                     : .rejected(sequence: seq, receipt: receipt)
         } catch {
             guard !isEnded else { return .ended }
-            return .heldOffline(sequence: seq)
+            // Nothing held if a newer batch uploaded meanwhile, or a revoke emptied the outbox.
+            return outbox.isEmpty ? .idle : .heldOffline(sequence: seq)
         }
     }
 
