@@ -187,9 +187,10 @@ public final class ScenarioModel {
                 outcome = await session.ingest(fix, conditions: conditions)
                 if outcome == .suppressed(.inaccurate) { log(second, "650 m fix ignored (accuracy)") }
             }
-            if case .published(let reason, let seq, let receipt) = outcome {
+            if case .published(let reason, _, let receipt) = outcome {
                 for v in receipt.deliveredLive { expectedLive[v, default: 0] += 1 }
-                if reason != .moved || seq % 8 == 1 {
+                // Log the first point and every heartbeat; movement updates are summarised on the Sharer tab.
+                if reason != .moved {
                     log(second, "\(reason.rawValue) → live \(receipt.deliveredLive.count), push-queued \(receipt.queuedForPush.count)")
                 }
             }

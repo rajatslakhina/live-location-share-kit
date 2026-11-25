@@ -158,9 +158,10 @@ struct TimelineTab: View {
                     Text(e.minute).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                     Text(e.text).font(.footnote)
                 }
-                .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 4, trailing: 16))
+                .listRowInsets(EdgeInsets(top: 2, leading: 16, bottom: 2, trailing: 16))
             }
             .listStyle(.plain)
+            .environment(\.defaultMinListRowHeight, 26)
             .compactTitle("Timeline")
             .overlay { if !model.finished { RunningPlaceholder(running: model.isRunning) } }
         }
