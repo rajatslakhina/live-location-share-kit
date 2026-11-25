@@ -282,7 +282,7 @@ struct CapacityTab: View {
     }
 
     /// Fixed grouping (1,234,567) whatever the device region, so the numbers match the README.
-    static let numbers = Locale(identifier: "en_US_POSIX")
+    static let numbers = Locale(identifier: "en_US")
 
     private func fmt(_ d: Double) -> String {
         d >= 100 ? Saturating.int(d.rounded()).formatted(.number.locale(Self.numbers)) : String(format: "%.1f", d)
