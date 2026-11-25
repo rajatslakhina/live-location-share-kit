@@ -55,13 +55,21 @@ public enum RelayError: Error, Equatable, Sendable {
 
 public enum RejectReason: String, Sendable, Hashable {
     case unknownShare, shareExpired, notARecipient, staleSequence
+    /// The sequence is beyond anything a real sharer could have reached by now (see
+    /// `LocationRelay.maxSequenceLead`). Stops a single junk copy at `UInt64.max` from locking a share.
+    case futureSequence
 }
 
+/// The relay's answer to one batch. A batch is one point for one share (that is how `SharerSession`
+/// uploads), so `rejected` is keyed by viewer.
 public struct PublishReceipt: Sendable, Hashable {
     public internal(set) var deliveredLive: [ViewerID] = []
     public internal(set) var queuedForPush: [ViewerID] = []
     public internal(set) var rejected: [ViewerID: RejectReason] = [:]
     public init() {}
+
+    /// True when at least one copy was accepted.
+    public var accepted: Bool { !deliveredLive.isEmpty || !queuedForPush.isEmpty }
 
     /// True when nothing was accepted and every rejection says the share no longer exists — the sharer
     /// should stop publishing.
@@ -103,8 +111,8 @@ public struct RelayStats: Sendable, Hashable {
 ///
 /// Every method is synchronous inside the actor — there is no `await` between reading and writing state,
 /// so there is no actor-reentrancy window. Storage is bounded by `maxActiveShares × maxViewersPerShare`.
-/// Housekeeping is indexed: `sweep()` is O(1) until something is actually due to expire, and per-viewer
-/// cleanup uses a viewer → shares index instead of scanning every share.
+/// Housekeeping: `sweep()` is O(1) until an expiry is due, then O(shares); per-viewer cleanup uses a
+/// viewer → shares index instead of scanning every share.
 public actor LocationRelay {
     struct ShareRecord {
         var viewers: Set<ViewerID>
@@ -126,6 +134,9 @@ public actor LocationRelay {
     /// Control backlog per connection. Each share produces at most one `revoked` and one `ended` per viewer,
     /// so this is only reached by a consumer that never reads; it then keeps the newest events.
     public static let controlBuffer = 1_024
+    /// How far ahead of the relay's clock a sharer's epoch sequence (`SharerSession.epochSequence`) may be.
+    /// Bounds clock skew between devices; anything further ahead is rejected as `.futureSequence`.
+    public static let maxSequenceLead = Millis.minutes(5)
 
     public nonisolated let configuration: RelayConfiguration
     private let clock: any LiveClock
@@ -167,7 +178,8 @@ public actor LocationRelay {
         return expiresAt
     }
 
-    /// Adds a viewer to a running share (the sharer must also `PerViewerSealer.add` their key).
+    /// Adds a viewer to a running share. The sharer must also call `SharerSession.addViewer` so the next
+    /// point is sealed for them.
     public func addViewer(_ viewer: ViewerID, to share: ShareID) throws {
         _ = sweep()
         guard var record = shares[share] else { throw RelayError.unknownShare }
@@ -218,6 +230,10 @@ public actor LocationRelay {
             guard now < record.expiresAt else { receipt.rejected[copy.viewerID] = .shareExpired; continue }
             guard record.viewers.contains(copy.viewerID) else {
                 receipt.rejected[copy.viewerID] = .notARecipient
+                continue
+            }
+            guard copy.sequence <= SharerSession.epochSequence(now.adding(Self.maxSequenceLead)) else {
+                receipt.rejected[copy.viewerID] = .futureSequence
                 continue
             }
             // Latest-wins with a monotonic sequence: an older copy that arrives late is dropped, so

@@ -23,13 +23,16 @@ final class ScenarioModelTests: XCTestCase {
         guard model.viewers.count == 3 else { return XCTFail("expected three viewers") }
         let alice = model.viewers[0], bob = model.viewers[1], carol = model.viewers[2]
         guard case .live = alice.freshness else { return XCTFail("Alice: \(alice.freshness)") }
-        guard case .stale = bob.freshness else { return XCTFail("Bob: \(bob.freshness)") }
+        guard case .behind = bob.freshness else { return XCTFail("Bob: \(bob.freshness)") }
         XCTAssertEqual(carol.freshness, .ended)
         XCTAssertEqual(alice.received, ScenarioExpectations.uploaded, "Alice decrypted every point")
         XCTAssertNotNil(bob.latitude)
         XCTAssertNotEqual(bob.longitude, alice.longitude, "Bob's pin is an earlier, en-route point")
         XCTAssertNil(carol.latitude, "a revoked viewer has no pin")
-        XCTAssertGreaterThan(model.copyBytes, 0)
+        XCTAssertEqual(model.copyBytes, ScenarioExpectations.copyBytes)
+        XCTAssertEqual(bob.received, ScenarioExpectations.bobDecrypted)
+        XCTAssertEqual(carol.received, ScenarioExpectations.carolDecrypted)
+        XCTAssertEqual(model.budgetRemaining, ScenarioExpectations.budgetLeft)
     }
 }
 
@@ -38,4 +41,8 @@ enum ScenarioExpectations {
     static let fixes = 420
     static let uploaded = 37
     static let heartbeats = 6
+    static let copyBytes = 365
+    static let bobDecrypted = 5
+    static let carolDecrypted = 29
+    static let budgetLeft = 1
 }

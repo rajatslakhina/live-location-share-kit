@@ -3,12 +3,16 @@ import Foundation
 /// The sharer's path to the relay. `LocationRelay` conforms directly (in-process, as in the demo);
 /// a production client would implement it over HTTPS.
 public protocol RelayUplink: Sendable {
+    /// The relay's presence TTL. The session reads its heartbeat interval from here, so the two can never
+    /// disagree.
+    var presenceTTL: Millis { get }
     func upload(_ copies: [SealedPoint]) async throws -> PublishReceipt
     func revoke(_ viewer: ViewerID, from share: ShareID) async throws
     func stop(_ share: ShareID) async throws
 }
 
 extension LocationRelay: RelayUplink {
+    public nonisolated var presenceTTL: Millis { configuration.presenceTTL }
     public func upload(_ copies: [SealedPoint]) async throws -> PublishReceipt { publish(copies) }
     public func stop(_ share: ShareID) async throws { stopShare(share) }
 }
@@ -35,7 +39,7 @@ public struct SessionCounters: Sendable, Hashable {
     public internal(set) var fixesSeen = 0
     /// Batches sealed (each is one point, one copy per viewer).
     public internal(set) var sealed = 0
-    /// Batches the relay actually received (including ones flushed from the offline outbox).
+    /// Batches the relay accepted for at least one viewer (including ones flushed from the offline outbox).
     public internal(set) var uploaded = 0
     public internal(set) var heartbeats = 0
     public internal(set) var suppressed: [SuppressReason: Int] = [:]
@@ -47,7 +51,7 @@ public struct SessionCounters: Sendable, Hashable {
 /// → `RelayUplink`, with a latest-wins offline outbox.
 ///
 /// **Reentrancy.** Everything that must be atomic — the gate decision, the budget token, the sequence
-/// number, the sealing and the gate commit — happens *before* the only `await` (the upload). Two
+/// number, the sealing and the gate commit — happens *before* the upload `await` in `ingest`/`tick`. Two
 /// concurrent `ingest` calls therefore always get distinct, increasing sequence numbers, and if their
 /// uploads land out of order the relay's monotonic check drops the older one. After the `await`, the
 /// outbox is only ever replaced by a *newer* sequence, and only with copies for current recipients.
@@ -55,7 +59,8 @@ public struct SessionCounters: Sendable, Hashable {
 /// **Relaunch.** iOS kills background apps mid-share. To resume, persist `sealer.privateKeyRaw` (Keychain)
 /// and restore with `PerViewerSealer(shareID:privateKeyRaw:)`. Sequences need no persistence by default:
 /// they start at `epochSequence(now)` = wall-clock ms × 2¹⁶, so a relaunched session always starts above
-/// everything the previous one sent (unless the device clock is set back).
+/// everything the previous one sent (unless the device clock is set back). The app must also persist the
+/// viewer list (IDs + public keys) and `unacknowledgedRevocations`, and re-apply them after relaunch.
 public actor SharerSession {
     public let shareID: ShareID
     private var sealer: PerViewerSealer
@@ -70,18 +75,18 @@ public actor SharerSession {
     private var outboxSequence: UInt64 = 0
     private var outboxReason: PublishReason = .moved
     private var pendingRelayRevocations: Set<ViewerID> = []
+    private var pendingRelayStop = false
     public private(set) var isEnded = false
     public private(set) var counters = SessionCounters()
     public private(set) var lastCadence: PublishCadence?
 
     /// - Parameters:
-    ///   - presenceTTL: must be the relay's `configuration.presenceTTL` (clamped to ≥ 2 s like the relay's).
     ///   - discretionaryBudget: movement publishes allowed per session as a burst, refilling one per
     ///     `budgetRefill`. Heartbeats never spend it — presence must not die because the user walked a lot.
     ///   - startingSequence: defaults to `epochSequence(clock.now())`; pass an explicit value only in tests
     ///     or if you persist sequences yourself.
     public init(shareID: ShareID, manifest: CapabilityManifest, sealer: PerViewerSealer,
-                uplink: any RelayUplink, clock: any LiveClock, presenceTTL: Millis,
+                uplink: any RelayUplink, clock: any LiveClock,
                 discretionaryBudget: Int = 120, budgetRefill: Millis = .seconds(30),
                 maxAccuracyMeters: Double = 200, startingSequence: UInt64? = nil) throws {
         guard manifest.capabilities.contains(.liveLocationSharing) else { throw SessionError.capabilityNotDeclared }
@@ -89,7 +94,7 @@ public actor SharerSession {
         self.sealer = sealer
         self.uplink = uplink
         self.clock = clock
-        self.presenceTTL = max(PublishPolicy.minimumPresenceTTL, presenceTTL)
+        self.presenceTTL = max(PublishPolicy.minimumPresenceTTL, uplink.presenceTTL)
         self.gate = PublishGate(maxAccuracyMeters: maxAccuracyMeters)
         self.budget = TokenBucket(capacity: discretionaryBudget, refillEvery: budgetRefill, now: clock.now())
         self.nextSequence = max(1, startingSequence ?? Self.epochSequence(clock.now()))
@@ -111,6 +116,15 @@ public actor SharerSession {
     public var heldBatchRecipients: [ViewerID] { outbox.map(\.viewerID) }
     /// Viewers whose relay-side revocation has not been acknowledged yet (retried by `flushOutbox`).
     public var unacknowledgedRevocations: Set<ViewerID> { pendingRelayRevocations }
+    /// True when `stop()` could not reach the relay yet (retried by `flushOutbox`).
+    public var stopUnacknowledged: Bool { pendingRelayStop }
+
+    /// Adds a viewer to the running share. Call `LocationRelay.addViewer` (or its network equivalent)
+    /// too; the next point is sealed for them.
+    public func addViewer(_ viewer: ViewerID, publicKey: Data) throws {
+        try sealer.add(viewer, publicKey: publicKey)
+        pendingRelayRevocations.remove(viewer)
+    }
 
     /// Feeds one fix from CoreLocation (or a simulator route).
     public func ingest(_ fix: LocationFix, conditions: DeviceConditions) async -> IngestOutcome {
@@ -151,10 +165,13 @@ public actor SharerSession {
     /// Retries unacknowledged relay revocations, then the held batch, if any. Location is latest-wins,
     /// so only the newest batch is ever kept.
     public func flushOutbox() async -> IngestOutcome {
-        guard !isEnded else { return .ended }
+        // Relay-side cleanup is retried even after the share ended: a revoke or stop that failed offline
+        // must still reach the relay, or it would keep stored copies until the share expires.
         for viewer in pendingRelayRevocations.sorted() {
             if (try? await uplink.revoke(viewer, from: shareID)) != nil { pendingRelayRevocations.remove(viewer) }
         }
+        if pendingRelayStop, (try? await uplink.stop(shareID)) != nil { pendingRelayStop = false }
+        guard !isEnded else { return .ended }
         // The outbox never holds a copy for a revoked viewer: `send` filters on the way in and `revoke`
         // removes on the way out, so it can be uploaded as is.
         guard !outbox.isEmpty else { return .idle }
@@ -162,7 +179,7 @@ public actor SharerSession {
         do {
             let receipt = try await uplink.upload(batch)
             if outboxSequence == seq { outbox = [] }             // a newer batch may have replaced it meanwhile
-            counters.uploaded = Saturating.add(counters.uploaded, 1)
+            if receipt.accepted { counters.uploaded = Saturating.add(counters.uploaded, 1) }
             if receipt.shareIsGone { endLocally(); return .ended }
             return .published(reason, sequence: seq, receipt: receipt)
         } catch {
@@ -170,8 +187,9 @@ public actor SharerSession {
         }
     }
 
-    /// Revokes locally *first* — no copy for `viewer` can be sealed or uploaded after this line, even if
-    /// an upload is in flight and fails back into the outbox — then tells the relay to delete its copy.
+    /// Revokes locally *first* — nothing new is sealed for `viewer` after this line, and the outbox drops
+    /// them even if an in-flight upload fails back into it — then tells the relay to delete its copy.
+    /// A batch already in flight may still arrive; the relay refuses it once its revocation lands.
     /// - Returns: whether the relay acknowledged. If not, `flushOutbox` retries it.
     @discardableResult
     public func revoke(_ viewer: ViewerID) async -> Bool {
@@ -188,15 +206,24 @@ public actor SharerSession {
     }
 
     /// Ends the share: nothing more is sealed or uploaded, and the relay is asked to delete everything.
-    public func stop() async {
+    /// - Returns: whether the relay acknowledged. If not, `flushOutbox` retries it (and any pending revokes).
+    @discardableResult
+    public func stop() async -> Bool {
         endLocally()
-        try? await uplink.stop(shareID)
+        do {
+            try await uplink.stop(shareID)
+            pendingRelayStop = false
+            return true
+        } catch {
+            pendingRelayStop = true
+            return false
+        }
     }
 
+    /// Local end: drop the outbox. Pending relay revocations are kept so `flushOutbox` can still deliver them.
     private func endLocally() {
         isEnded = true
         outbox = []
-        pendingRelayRevocations = []
     }
 
     private func send(_ payload: PointPayload, spendsBudget: Bool) async -> IngestOutcome {
@@ -213,7 +240,7 @@ public actor SharerSession {
         if payload.reason == .heartbeat { counters.heartbeats = Saturating.add(counters.heartbeats, 1) }
         do {
             let receipt = try await uplink.upload(copies)
-            counters.uploaded = Saturating.add(counters.uploaded, 1)
+            if receipt.accepted { counters.uploaded = Saturating.add(counters.uploaded, 1) }
             if outboxSequence <= seq { outbox = []; outboxSequence = seq }   // supersedes anything older
             if receipt.shareIsGone { endLocally(); return .ended }
             return .published(payload.reason, sequence: seq, receipt: receipt)

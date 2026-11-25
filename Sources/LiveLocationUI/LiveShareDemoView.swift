@@ -4,7 +4,7 @@ import LiveLocation
 
 /// Root view of the demo: four tabs, each backed by real library calls.
 public struct LiveShareDemoView: View {
-    public enum Tab: String, CaseIterable, Sendable { case sharer, viewers, capacity, gate }
+    public enum Tab: String, CaseIterable, Sendable { case sharer, timeline, viewers, capacity, gate }
 
     @State private var model: ScenarioModel
     @State private var selection: Tab
@@ -20,6 +20,7 @@ public struct LiveShareDemoView: View {
     public var body: some View {
         TabView(selection: $selection) {
             SharerTab(model: model).tabItem { Label("Sharer", systemImage: "location.fill") }.tag(Tab.sharer)
+            TimelineTab(model: model).tabItem { Label("Timeline", systemImage: "list.bullet.rectangle") }.tag(Tab.timeline)
             ViewersTab(model: model).tabItem { Label("Viewers", systemImage: "person.3.fill") }.tag(Tab.viewers)
             CapacityTab(model: model).tabItem { Label("Capacity", systemImage: "gauge.with.dots.needle.67percent") }.tag(Tab.capacity)
             GateTab(model: model).tabItem { Label("Age rating", systemImage: "checkmark.shield") }.tag(Tab.gate)
@@ -119,16 +120,8 @@ struct SharerTab: View {
                             }
                         }
                         Card(title: "Timeline") {
-                            DisclosureGroup("\(model.timeline.count) events") {
-                                ForEach(model.timeline) { e in
-                                    HStack(alignment: .firstTextBaseline, spacing: 8) {
-                                        Text(e.minute).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-                                        Text(e.text).font(.caption)
-                                        Spacer(minLength: 0)
-                                    }
-                                }
-                            }
-                            .font(.subheadline)
+                            Text("\(model.timeline.count) events — outage, flush, revocation and every push — on the Timeline tab.")
+                                .font(.subheadline)
                         }
                     }
                 }
@@ -149,6 +142,27 @@ extension SuppressReason {
         case .budgetExhausted: return "Battery budget spent"
         case .inaccurate: return "GPS accuracy too poor"
         case .outOfOrder: return "Out-of-order fix"
+        }
+    }
+}
+
+// MARK: - Timeline
+
+struct TimelineTab: View {
+    let model: ScenarioModel
+
+    var body: some View {
+        NavigationStack {
+            List(model.timeline) { e in
+                HStack(alignment: .firstTextBaseline, spacing: 10) {
+                    Text(e.minute).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                    Text(e.text).font(.footnote)
+                }
+                .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 4, trailing: 16))
+            }
+            .listStyle(.plain)
+            .compactTitle("Timeline")
+            .overlay { if !model.finished { RunningPlaceholder(running: model.isRunning) } }
         }
     }
 }
@@ -184,13 +198,13 @@ struct ViewersTab: View {
     private var map: some View {
         // Viewers who last decrypted the same point share one marker ("Alice, Bob see"), so a pin is never
         // hidden underneath another.
-        var groups: [(names: [String], coordinate: CLLocationCoordinate2D)] = []
+        var groups: [(names: [String], coordinate: CLLocationCoordinate2D, freshness: Freshness)] = []
         for v in model.viewers {
             guard let lat = v.latitude, let lon = v.longitude else { continue }
             if let i = groups.firstIndex(where: { $0.coordinate.latitude == lat && $0.coordinate.longitude == lon }) {
                 groups[i].names.append(v.name)
             } else {
-                groups.append(([v.name], CLLocationCoordinate2D(latitude: lat, longitude: lon)))
+                groups.append(([v.name], CLLocationCoordinate2D(latitude: lat, longitude: lon), v.freshness))
             }
         }
         return Map {
@@ -198,7 +212,7 @@ struct ViewersTab: View {
                 .stroke(.blue.opacity(0.5), lineWidth: 4)
             ForEach(groups.indices, id: \.self) { i in
                 Marker("\(groups[i].names.joined(separator: " & ")) \(groups[i].names.count == 1 ? "sees" : "see")", coordinate: groups[i].coordinate)
-                    .tint(i == 0 ? .green : .orange)
+                    .tint(color(groups[i].freshness))
             }
         }
         .frame(height: 210)
@@ -209,7 +223,7 @@ struct ViewersTab: View {
         HStack(alignment: .firstTextBaseline, spacing: 10) {
             Circle().fill(color(v.freshness)).frame(width: 10, height: 10)
             VStack(alignment: .leading, spacing: 2) {
-                Text("\(v.name) · \(v.freshness.label)").font(.headline)
+                Text("\(v.name) · \(v.channel == .revoked ? "Revoked, pin removed" : v.freshness.label)").font(.headline)
                 Text("\(v.channel.rawValue) · \(v.received) decrypted\(v.rejected > 0 ? " · \(v.rejected) rejected" : "")")
                     .font(.footnote).foregroundStyle(.secondary)
             }
@@ -222,7 +236,7 @@ struct ViewersTab: View {
     private func color(_ f: Freshness) -> Color {
         switch f {
         case .live: return .green
-        case .delayed: return .yellow
+        case .delayed, .behind: return .yellow
         case .stale, .offline: return .orange
         case .waiting, .ended: return .gray
         }

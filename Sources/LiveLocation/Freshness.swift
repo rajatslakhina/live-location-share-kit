@@ -6,6 +6,7 @@ public enum Freshness: Hashable, Sendable {
     case waiting                     // share started, nothing received yet
     case live(age: Millis)           // within 1.5 heartbeats
     case delayed(age: Millis)        // late, but presence TTL not yet exceeded
+    case behind(age: Millis)         // the sharer is online, but this viewer's copy is old (e.g. push budget)
     case stale(age: Millis)          // past the presence TTL: show "last seen", not a live dot
     case offline(lastKnownAge: Millis?)  // the viewer has no network; the pin is whatever we last had
     case ended                       // expired, stopped or revoked: remove the pin
@@ -15,6 +16,7 @@ public enum Freshness: Hashable, Sendable {
         case .waiting: return "Waiting for first update"
         case .live: return "Live"
         case .delayed(let a): return "Delayed · \(a.value / 1_000)s"
+        case .behind(let a): return "Updated \(Freshness.human(a)) ago · sharer online"
         case .stale(let a): return "Last seen \(Freshness.human(a)) ago"
         case .offline(let a): return a.map { "You're offline · last known \(Freshness.human($0)) ago" } ?? "You're offline"
         case .ended: return "Sharing ended"
@@ -31,14 +33,17 @@ public enum Freshness: Hashable, Sendable {
     /// - Parameters:
     ///   - lastSentAt: `sentAt` of the newest decrypted copy (heartbeats refresh it; position may be older).
     ///   - heartbeat: the sharer's heartbeat interval (presence TTL / 2 under `PublishPolicy`).
+    ///   - sharerOnline: the relay's presence for the share, if the viewer knows it. An old copy from an
+    ///     online sharer is `.behind` (this viewer is rate-limited), not `.stale` (the sharer went quiet).
     public static func classify(lastSentAt: Instant?, now: Instant, heartbeat: Millis, presenceTTL: Millis,
-                                isViewerOffline: Bool, hasEnded: Bool) -> Freshness {
+                                isViewerOffline: Bool, hasEnded: Bool, sharerOnline: Bool = false) -> Freshness {
         if hasEnded { return .ended }
         let age = lastSentAt.map { now.elapsed(since: $0) }
         if isViewerOffline { return .offline(lastKnownAge: age) }
         guard let age else { return .waiting }
         let liveWindow = Millis(Saturating.add(heartbeat.value, heartbeat.value / 2))
         if age <= liveWindow { return .live(age: age) }
+        if sharerOnline { return .behind(age: age) }
         if age <= presenceTTL { return .delayed(age: age) }
         return .stale(age: age)
     }

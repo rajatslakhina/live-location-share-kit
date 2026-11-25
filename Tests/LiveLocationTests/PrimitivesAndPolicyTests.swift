@@ -46,6 +46,16 @@ final class SaturatingAndTimeTests: XCTestCase {
         XCTAssertNotNil(LocationFix(latitude: 90, longitude: 180, accuracyMeters: 0, timestamp: t))
     }
 
+    func testDecodingCannotSmuggleInInvalidValues() throws {
+        let bad = #"{"latitude":500,"longitude":0,"accuracyMeters":5,"timestamp":{"millis":0}}"#
+        XCTAssertThrowsError(try JSONDecoder().decode(LocationFix.self, from: Data(bad.utf8)))
+        let good = #"{"latitude":12.5,"longitude":0,"accuracyMeters":5,"timestamp":{"millis":0}}"#
+        XCTAssertEqual(try JSONDecoder().decode(LocationFix.self, from: Data(good.utf8)).latitude, 12.5)
+        XCTAssertEqual(try JSONDecoder().decode(Millis.self, from: Data("-40".utf8)).value, 0)
+        let fix = try XCTUnwrap(LocationFix(latitude: 1, longitude: 2, accuracyMeters: 3, timestamp: Instant(millis: 4)))
+        XCTAssertEqual(try JSONDecoder().decode(LocationFix.self, from: JSONEncoder().encode(fix)), fix)
+    }
+
     func testHaversineMatchesKnownDistances() throws {
         let t = Instant(millis: 0)
         let a = try XCTUnwrap(LocationFix(latitude: 0, longitude: 0, accuracyMeters: 5, timestamp: t))

@@ -76,6 +76,15 @@ public struct Millis: Comparable, Hashable, Sendable, Codable, CustomStringConve
 
     public static func < (lhs: Millis, rhs: Millis) -> Bool { lhs.value < rhs.value }
 
+    /// Decoding goes through the clamping initialiser, so JSON cannot produce a negative duration.
+    public init(from decoder: Decoder) throws {
+        self.init(try decoder.singleValueContainer().decode(Int64.self))
+    }
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.singleValueContainer()
+        try c.encode(value)
+    }
+
     public func times(_ k: Int64) -> Millis { Millis(Saturating.multiply(value, k)) }
     public func dividedBy(_ k: Int64) -> Millis { k > 0 ? Millis(value / k) : self }
 
@@ -145,6 +154,19 @@ public struct LocationFix: Hashable, Sendable, Codable {
         self.longitude = longitude
         self.accuracyMeters = accuracyMeters
         self.timestamp = timestamp
+    }
+
+    private enum CodingKeys: String, CodingKey { case latitude, longitude, accuracyMeters, timestamp }
+
+    /// Decoding goes through the validating initialiser, so JSON cannot smuggle in an invalid fix.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        guard let fix = LocationFix(latitude: try c.decode(Double.self, forKey: .latitude),
+                                    longitude: try c.decode(Double.self, forKey: .longitude),
+                                    accuracyMeters: try c.decode(Double.self, forKey: .accuracyMeters),
+                                    timestamp: try c.decode(Instant.self, forKey: .timestamp))
+        else { throw DecodingError.dataCorrupted(.init(codingPath: c.codingPath, debugDescription: "invalid location fix")) }
+        self = fix
     }
 
     /// Great-circle distance in metres (haversine). Always finite and non-negative for valid fixes.

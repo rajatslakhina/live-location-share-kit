@@ -6,7 +6,8 @@ import LiveLocation
 actor SwitchableUplink: RelayUplink {
     let relay: LocationRelay
     var isDown = false
-    init(relay: LocationRelay) { self.relay = relay }
+    nonisolated let presenceTTL: Millis
+    init(relay: LocationRelay) { self.relay = relay; self.presenceTTL = relay.configuration.presenceTTL }
     func setDown(_ down: Bool) { isDown = down }
     func upload(_ copies: [SealedPoint]) async throws -> PublishReceipt {
         if isDown { throw URLError(.notConnectedToInternet) }
@@ -84,6 +85,7 @@ public final class ScenarioModel {
     private var expectedLive: [ViewerID: Int] = [:]
     private var revoked: Set<ViewerID> = []
     private var consumers: [Task<Void, Never>] = []
+    private var sharerOnline = false
 
     let alice = ViewerID("alice"), bob = ViewerID("bob"), carol = ViewerID("carol")
     private let names: [ViewerID: String]
@@ -122,8 +124,7 @@ public final class ScenarioModel {
         do {
             try await relay.startShare(shareID, viewers: [alice, bob, carol], duration: .hours(1))
             session = try SharerSession(shareID: shareID, manifest: manifest, sealer: sealer, uplink: uplink,
-                                        clock: clock, presenceTTL: relay.configuration.presenceTTL,
-                                        discretionaryBudget: Self.demoBudget, budgetRefill: .seconds(60))
+                                        clock: clock, discretionaryBudget: Self.demoBudget, budgetRefill: .seconds(60))
         } catch {
             log(0, "Session refused: \(error)")
             return
@@ -212,7 +213,8 @@ public final class ScenarioModel {
         relayStats = await relay.stats
         if let sample = await relay.latest(shareID, for: alice) {
             copyBytes = sample.approximateByteCount
-            sampleCiphertext = sample.ciphertext.prefix(18).map { String(format: "%02x", $0) }.joined()
+            // Skip the 12-byte nonce so the card shows ciphertext proper.
+            sampleCiphertext = sample.ciphertext.dropFirst(12).prefix(18).map { String(format: "%02x", $0) }.joined()
         }
         // Wait (bounded) until every live delivery has been consumed, so the final render is deterministic.
         for _ in 0..<10_000 {
@@ -223,6 +225,10 @@ public final class ScenarioModel {
             await Task.yield()
         }
         consumers.forEach { $0.cancel() }
+        // Forget ended shares only now, after every buffered point was consumed, so counts never depend
+        // on how the points and control tasks happened to interleave.
+        for viewer in revoked { inboxes[viewer]?.forget(shareID) }
+        if case .online = await relay.presence(of: shareID) { sharerOnline = true }
         refreshViewers()
         log(Self.scenarioMinutes * 60, "Scenario complete")
     }
@@ -241,9 +247,8 @@ public final class ScenarioModel {
 
     private func control(_ event: ControlEvent, for viewer: ViewerID) {
         switch event {
-        case .revoked(let share), .ended(let share, _):
-            inboxes[viewer]?.forget(share)
-            revoked.insert(viewer)
+        case .revoked, .ended:
+            revoked.insert(viewer)          // the pin is removed now; the inbox is forgotten after draining
         }
     }
 
@@ -254,7 +259,7 @@ public final class ScenarioModel {
             let gone = revoked.contains(id)
             let fresh = Freshness.classify(lastSentAt: latest?.sentAt, now: now,
                                            heartbeat: config.presenceTTL.dividedBy(2), presenceTTL: config.presenceTTL,
-                                           isViewerOffline: false, hasEnded: gone)
+                                           isViewerOffline: false, hasEnded: gone, sharerOnline: sharerOnline)
             return ViewerRow(id: id, name: names[id] ?? id.raw,
                              channel: gone ? .revoked : (id == bob ? .push : .socket),
                              freshness: fresh,
@@ -275,7 +280,7 @@ public final class ScenarioModel {
         do {
             _ = try SharerSession(shareID: ShareID("probe"), manifest: CapabilityManifest(capabilities: [.locationForAppFeatures]),
                                   sealer: PerViewerSealer(shareID: ShareID("probe")), uplink: LocationRelay(),
-                                  clock: ManualClock(), presenceTTL: .seconds(120))
+                                  clock: ManualClock())
             return "started (the gate is broken)"
         } catch {
             return "refused (\(error))"

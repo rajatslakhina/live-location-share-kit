@@ -192,14 +192,28 @@ final class RelayTests: XCTestCase {
 
     func testSlowConsumerKeepsOnlyNewestPointsButNeverLosesControlEvents() async throws {
         let (relay, _) = makeRelay(RelayConfiguration(connectionBuffer: 3))
+        let other = ShareID("t")
         try await relay.startShare(s, viewers: [a], duration: .hours(1))
+        try await relay.startShare(other, viewers: [a], duration: .hours(1))
         let conn = await relay.connect(a)
-        for seq in 1...50 as ClosedRange<UInt64> { _ = await relay.publish([sealedCopy("s", "a", seq)]) }
-        await relay.revoke(a, from: s)                       // the "remove the pin" event, mid-burst
+        await relay.stopShare(s)                             // "remove the pin" for share s, sent FIRST…
+        for seq in 1...50 as ClosedRange<UInt64> { _ = await relay.publish([sealedCopy("t", "a", seq)]) }  // …then a burst
         let events = await first(conn.points, count: 3)
-        XCTAssertEqual(events, [sealedCopy("s", "a", 48), sealedCopy("s", "a", 49), sealedCopy("s", "a", 50)])
+        XCTAssertEqual(events, [sealedCopy("t", "a", 48), sealedCopy("t", "a", 49), sealedCopy("t", "a", 50)])
         let control = await first(conn.control, count: 1)
-        XCTAssertEqual(control, [.revoked(s)], "a points burst can never evict a control event")
+        XCTAssertEqual(control, [.ended(s, .stopped)], "a later burst of points can never evict an earlier control event")
+    }
+
+    func testAJunkCopyAtAHugeSequenceCannotLockAShare() async throws {
+        let (relay, clock) = makeRelay()
+        try await relay.startShare(s, viewers: [a], duration: .hours(1))
+        let junk = await relay.publish([sealedCopy("s", "a", .max)])
+        XCTAssertEqual(junk.rejected[a], .futureSequence)
+        let genuine = await relay.publish([sealedCopy("s", "a", SharerSession.epochSequence(clock.now()))])
+        XCTAssertEqual(genuine.queuedForPush, [a], "the real sharer is not locked out")
+        let skewed = SharerSession.epochSequence(clock.now().adding(.minutes(4)))
+        let ahead = await relay.publish([sealedCopy("s", "a", skewed)])
+        XCTAssertEqual(ahead.queuedForPush, [a], "a sharer clock up to 5 min ahead is accepted")
     }
 
     func testDisconnectedStreamFallsBackToPush() async throws {

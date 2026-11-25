@@ -5,6 +5,7 @@ import XCTest
 /// when another call runs inside `SharerSession` at its `await`.
 actor GatedUplink: RelayUplink {
     let relay: LocationRelay
+    nonisolated var presenceTTL: Millis { relay.configuration.presenceTTL }
     private var holdNext = false
     private var parked: [CheckedContinuation<Void, Never>] = []
     private(set) var uploads: [[SealedPoint]] = []
@@ -30,7 +31,10 @@ actor GatedUplink: RelayUplink {
         await relay.revoke(viewer, from: share)
     }
 
-    func stop(_ share: ShareID) async throws { await relay.stopShare(share) }
+    func stop(_ share: ShareID) async throws {
+        if failing { throw URLError(.notConnectedToInternet) }
+        await relay.stopShare(share)
+    }
 }
 
 final class SharerSessionTests: XCTestCase {
@@ -47,8 +51,7 @@ final class SharerSessionTests: XCTestCase {
         var sealer = PerViewerSealer(shareID: share)
         for k in keys { try sealer.add(k.viewerID, publicKey: k.publicKey) }
         let uplink = GatedUplink(relay: relay)
-        let session = try SharerSession(shareID: share, manifest: manifest, sealer: sealer, uplink: uplink, clock: clock,
-                                        presenceTTL: relay.configuration.presenceTTL, discretionaryBudget: budget,
+        let session = try SharerSession(shareID: share, manifest: manifest, sealer: sealer, uplink: uplink, clock: clock, discretionaryBudget: budget,
                                         budgetRefill: .hours(1), startingSequence: startingSequence)
         self.sealer = sealer
         return (session, uplink, relay, clock)
@@ -62,7 +65,7 @@ final class SharerSessionTests: XCTestCase {
     func testSessionRefusesToExistWithoutTheDeclaredCapability() {
         XCTAssertThrowsError(try SharerSession(shareID: share, manifest: CapabilityManifest(capabilities: [.locationForAppFeatures]),
                                                sealer: PerViewerSealer(shareID: share), uplink: LocationRelay(),
-                                               clock: ManualClock(), presenceTTL: .seconds(120))) {
+                                               clock: ManualClock())) {
             XCTAssertEqual($0 as? SessionError, .capabilityNotDeclared)
         }
     }
@@ -151,7 +154,7 @@ final class SharerSessionTests: XCTestCase {
         var restoredWithViewers = restored
         for k in keys { try restoredWithViewers.add(k.viewerID, publicKey: k.publicKey) }
         let relaunched = try SharerSession(shareID: share, manifest: manifest, sealer: restoredWithViewers,
-                                           uplink: relay, clock: clock, presenceTTL: relay.configuration.presenceTTL)
+                                           uplink: relay, clock: clock)
         let outcome = await relaunched.ingest(fix(0.5, clock), conditions: walking)
         guard case .published(.first, _, let receipt) = outcome else { return XCTFail("\(outcome)") }
         XCTAssertEqual(receipt.rejected, [:], "not mistaken for a replay")
@@ -161,7 +164,7 @@ final class SharerSessionTests: XCTestCase {
         XCTAssertEqual(try opener.open(try XCTUnwrap(latest)).fix.latitude, 0.5)
         // Control: a relaunch that restarted sequences at 1 would be locked out.
         let naive = try SharerSession(shareID: share, manifest: manifest, sealer: restoredWithViewers, uplink: relay,
-                                      clock: clock, presenceTTL: relay.configuration.presenceTTL, startingSequence: 1)
+                                      clock: clock, startingSequence: 1)
         clock.advance(by: .seconds(20))
         let locked = await naive.ingest(fix(0.6, clock), conditions: walking)
         guard case .published(_, _, let lockedReceipt) = locked else { return XCTFail("\(locked)") }
@@ -226,6 +229,41 @@ final class SharerSessionTests: XCTestCase {
         _ = await session.flushOutbox()
         c = await session.counters
         XCTAssertEqual(c.uploaded, 1, "counted once, when the relay actually received it")
+    }
+
+    func testAViewerAddedMidShareGetsTheNextPoint() async throws {
+        let (session, _, relay, clock) = try await setUp()
+        _ = await session.ingest(fix(0, clock), conditions: walking)
+        let dana = ViewerKeys(viewerID: ViewerID("d"))
+        try await relay.addViewer(dana.viewerID, to: share)
+        try await session.addViewer(dana.viewerID, publicKey: dana.publicKey)
+        clock.advance(by: .seconds(20))
+        _ = await session.ingest(fix(0.3, clock), conditions: walking)
+        var opener = PerViewerOpener(keys: dana)
+        opener.trust(share, sharerPublicKey: sealer.sharePublicKey)
+        let latest = await relay.latest(share, for: dana.viewerID)
+        XCTAssertEqual(try opener.open(try XCTUnwrap(latest)).fix.latitude, 0.3)
+    }
+
+    func testAStopThatFailsOfflineIsRetriedWithPendingRevocations() async throws {
+        let (session, uplink, relay, clock) = try await setUp()
+        _ = await session.ingest(fix(0, clock), conditions: walking)
+        await uplink.setFailing(true)
+        let revoked = await session.revoke(ViewerID("c"))
+        let stopped = await session.stop()
+        XCTAssertFalse(revoked)
+        XCTAssertFalse(stopped)
+        let stillThere = await relay.presence(of: share)
+        XCTAssertNotEqual(stillThere, .unknownShare, "the relay never heard the stop")
+        await uplink.setFailing(false)
+        let outcome = await session.flushOutbox()
+        XCTAssertEqual(outcome, .ended)
+        let gone = await relay.presence(of: share)
+        XCTAssertEqual(gone, .unknownShare, "the stop was retried after the share ended locally")
+        let pendingStop = await session.stopUnacknowledged
+        let pendingRevokes = await session.unacknowledgedRevocations
+        XCTAssertFalse(pendingStop)
+        XCTAssertEqual(pendingRevokes, [])
     }
 
     func testOfflineOutboxKeepsOnlyTheNewestBatch() async throws {
@@ -369,6 +407,15 @@ final class FreshnessTests: XCTestCase {
         XCTAssertEqual(classify(age: 91), .delayed(age: .seconds(91)))
         XCTAssertEqual(classify(age: 120), .delayed(age: .seconds(120)))
         XCTAssertEqual(classify(age: 121), .stale(age: .seconds(121)))
+    }
+
+    func testAnOldCopyFromAnOnlineSharerIsBehindNotStale() {
+        let now = Instant(millis: 1_000_000)
+        let f = Freshness.classify(lastSentAt: Instant(millis: now.millis - 360_000), now: now, heartbeat: hb,
+                                   presenceTTL: ttl, isViewerOffline: false, hasEnded: false, sharerOnline: true)
+        XCTAssertEqual(f, .behind(age: .seconds(360)))
+        XCTAssertEqual(f.label, "Updated 6m ago · sharer online")
+        XCTAssertEqual(classify(age: 360), .stale(age: .seconds(360)), "without presence it stays stale")
     }
 
     func testViewerOfflineAndEndedWinOverAge() {
