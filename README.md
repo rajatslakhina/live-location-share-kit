@@ -1,6 +1,10 @@
 # LiveLocationKit
 
-**"Design Find My", answered in Swift that compiles, runs and is tested.** The library covers six things:
+**"Design live location sharing", answered in Swift that compiles, runs and is tested.**
+
+> **TL;DR** In a 12-minute scripted share, 420 GPS fixes become 37 points. Each point goes out as one 365-byte end-to-end-encrypted copy per viewer, and the relay cannot read any of them. The repo includes 75 tests and 28 planted bugs, each of which a test must catch, plus a capacity estimate for 10 million concurrent shares. It ends with an honest list of what is *not* solved.
+
+The library covers six things:
 
 - **Adaptive publishing:** how often the sharer sends depends on motion and battery.
 - **Encryption:** each viewer gets their own end-to-end-encrypted copy, under a sharer key they pinned from the invitation.
@@ -14,7 +18,7 @@
 
 <img src="docs/viewers.png" width="300" align="right" alt="Demo app on the iOS Simulator. Alice's pin is live. Bob's pin is six minutes old because of his push budget, although the sharer is online. Carol has been revoked. The relay stores only ciphertext.">
 
-**Demo app:** [live-location-share-demo-app](https://github.com/rajatslakhina/live-location-share-demo-app) is a separate Xcode project that consumes this package as a remote Swift package. It requires a version from 1.0.4 up to, but not including, 2.0.0, and its `Package.resolved` pins the exact release. It runs a 12-minute scripted share (walk, then drive, then park) through every type below. It was run on the iOS Simulator, and the screenshot comes from that run.
+**Demo app:** [live-location-share-demo-app](https://github.com/rajatslakhina/live-location-share-demo-app) is a separate Xcode project that consumes this package as a remote Swift package. It requires a version from 2.0.0 up to, but not including, 3.0.0, and its `Package.resolved` pins the exact release. It runs a 12-minute scripted share (walk, then drive, then park) through the core types: session, sealer, relay, inbox, freshness, load model and gate. It was run on the iOS Simulator, and the screenshot comes from that run.
 
 In the run, 420 GPS fixes became 37 points. Alice watches live over a socket. Bob is backgrounded, so his pin falls behind under the push budget. Carol is revoked halfway through.
 
@@ -74,7 +78,7 @@ VIEWER DEVICE
 
 **Heartbeats instead of a stream when parked.**
 - A stationary phone publishes only a heartbeat every TTL / 2: the last fix, with a fresh `sentAt`. Viewers see "here, as of 40 s ago", and the relay's presence stays alive.
-- One lost heartbeat therefore lands *exactly* at the TTL boundary. That tolerance holds only if the heartbeat timer fires promptly; the snippet below ticks every second. With more timer slack or latency, shorten the heartbeat.
+- One lost heartbeat therefore lands *exactly* at the TTL boundary, so tolerating a loss needs a prompt timer. Every bit of timer slack is added to each interval: with the 1 s tick in the snippet below, one lost heartbeat can briefly read as "away" for about a second. If that matters, shorten the heartbeat.
 - *Rejected:* a fixed 1 Hz stream. In the demo's 12-minute share the sharer sends 37 points, 6 of them heartbeats, where a 1 Hz publisher would send 720.
 - *Rejected:* scaling the heartbeat with battery, the way the movement interval scales. That is the bug `testTheCheckCatchesAPolicyWhoseHeartbeatOutlivesTheTTL` feeds in, to prove the presence check is not vacuous.
 
@@ -98,7 +102,7 @@ VIEWER DEVICE
 **A monotonic sequence, assigned before the upload `await`.**
 - In `ingest` and `tick`, `SharerSession` decides, spends budget, assigns the sequence, seals and commits, all before uploading. Two overlapping calls therefore get increasing sequences in call order, and if their uploads land out of order the relay drops the older one.
 - Sequences start at wall-clock ms × 2¹⁶, so a relaunched app is not mistaken for a replay, unless the device clock moved backwards.
-- The relay refuses sequences more than 5 minutes ahead of its own clock. A single junk copy at `UInt64.max` therefore cannot lock a share.
+- The relay refuses sequences more than 5 minutes ahead of its own clock, so a junk copy at `UInt64.max` is rejected outright. Junk just inside the window can still block a share; see the limits.
 - *Rejected:* server-assigned sequence numbers, which need a round trip before every publish and break offline buffering.
 - *Rejected:* ordering by fix timestamp, because CoreLocation re-delivers fixes and heartbeats re-send old ones.
 
@@ -143,15 +147,16 @@ How that maps onto infrastructure (assumptions, not measurements):
 
 ## Verification
 
-- **Build and tests:** `swift build -Xswiftc -warnings-as-errors` from a clean `.build`, then `swift test` on macOS with Xcode 27.2. **71 tests, 0 failures**: 70 library tests plus 1 test that pins the demo scenario.
+- **Build and tests:** `swift build -Xswiftc -warnings-as-errors` from a clean `.build`, then `swift test` on macOS with Xcode 27.2. **75 tests, 0 failures**: 74 library tests plus 1 test that pins the demo scenario.
 - **iOS build:** `xcodebuild build` of both library targets for the iOS Simulator SDK, with warnings as errors.
-- **Mutation check:** `Scripts/mutation_check.py` plants 24 deliberate bugs, one at a time. Each mutant must compile, and its named test must **fail**. Each named test must also pass when no mutant is applied. Examples of the planted bugs:
+- **Mutation check:** `Scripts/mutation_check.py` plants 28 deliberate bugs, one at a time. Each mutant must compile, and its named test must **fail**. Each named test must also pass when no mutant is applied. Examples of the planted bugs:
   - accepting an equal sequence as new;
   - leaving the sharer-key pin unchecked;
   - dropping the future-sequence guard;
   - removing the revoke-before-await line;
   - re-adding revoked viewers to the outbox;
   - not retrying a failed stop;
+  - letting a stale revoke remove a re-added viewer;
   - doubling the TTL / 2 heartbeat;
   - dropping the plaintext padding;
   - serving pushes by name instead of age.
@@ -173,7 +178,8 @@ python3 Scripts/mutation_check.py
 - **There is no relay authentication.** Points stay unreadable and unforgeable, but routing and presence are open:
   - Anyone who can reach the relay can `connect` as another viewer's ID. That steals the viewer's future copies (still encrypted) and clears their queued pushes.
   - Anyone can keep presence alive by publishing.
-  - Anyone can publish a junk copy whose sequence sits up to 5 minutes ahead of now, which blocks genuine copies until the sharer's sequence catches up.
+  - Connections are capped per viewer (`maxConnectionsPerViewer`) and only allowed for viewers on a share, but without authentication anyone can use up a real viewer's connection slots.
+  - Anyone can publish a junk copy whose sequence sits up to 5 minutes ahead of now. That blocks genuine copies until the sharer's sequence catches up, and repeating it keeps the share blocked indefinitely. Each junk copy also displaces a background viewer's pending push, so the viewer receives junk (which fails to decrypt) instead of the real point.
   - Mitigation in production: share-scoped publish tokens and authenticated viewer sessions.
 - **A sharer whose clock runs more than 5 minutes ahead of the relay's** has every copy rejected as `futureSequence`.
 
@@ -182,8 +188,9 @@ python3 Scripts/mutation_check.py
 - **The relay still sees metadata:**
   - who shares with whom, when, and how often;
   - the session's start time and publish count, from the epoch-based sequence;
-  - coarse motion and battery state, from the publish cadence (5, 15 or 60 s intervals; 2× or 4× stretch).
+  - coarse motion and battery state, from the publish cadence (5, 10, 15, 30 or 60 s intervals; 2× or 4× stretch).
   Plaintext padding hides only the publish reason.
+- **No sender signature (key-compromise impersonation).** Static-static X25519 means that whoever steals a viewer's private key can also forge sharer points *to that viewer*. Signing each envelope with Ed25519, the rejected alternative above, would close this gap.
 - **Forward secrecy is limited.** There is one X25519 key per share, so compromising it exposes that share's copies. Compromising a viewer's long-term key exposes every share ever sent to that viewer.
 - **Viewer replay state lives in memory.** `PointInbox` rejects replays only within one app process.
 
@@ -204,7 +211,7 @@ python3 Scripts/mutation_check.py
 ## Use it
 
 ```swift
-.package(url: "https://github.com/rajatslakhina/live-location-share-kit.git", from: "1.0.4")
+.package(url: "https://github.com/rajatslakhina/live-location-share-kit.git", from: "2.0.0")
 ```
 
 **Sharer:**
@@ -226,18 +233,20 @@ let session = try SharerSession(shareID: share, manifest: manifest, sealer: seal
                                 uplink: relay, clock: SystemClock())
 
 // A 1 s timer: heartbeats keep presence alive when CoreLocation goes quiet; the flush retries the
-// offline outbox and any revoke or stop that failed.
+// offline outbox and any revoke or stop that failed — including after the share ends.
 let timer = Task {
     while !Task.isCancelled {
         try await Task.sleep(for: .seconds(1))
         _ = await session.tick(conditions: DeviceConditions(batteryLevel: 0.8, motion: .stationary))
         _ = await session.flushOutbox()
+        if await session.isEnded, !(await session.stopUnacknowledged),
+           (await session.unacknowledgedRevocations).isEmpty { break }    // relay has everything; done
     }
 }
-for await fix in LiveUpdatesSource.fixes(for: .walking) {
+for await fix in LiveUpdatesSource.fixes(for: .walking) {             // until the user taps Stop
     if await session.ingest(fix, conditions: DeviceConditions(batteryLevel: 0.8, motion: .walking)) == .ended { break }
 }
-timer.cancel()
+await session.stop()                                                // the timer keeps retrying until acknowledged
 ```
 
 **Viewer:**
@@ -251,7 +260,7 @@ timer.cancel()
 var inbox = PointInbox(opener: PerViewerOpener(keys: aliceKeys))
 inbox.trust(share, sharerPublicKey: invitationKey)
 let pins = await Pins(inbox)
-let connection = await relay.connect(aliceID)
+let connection = try await relay.connect(aliceID)
 Task { @MainActor in
     for await event in connection.control {             // revoked / ended: remove the pin
         switch event { case .revoked(let s), .ended(let s, _): pins.inbox.forget(s) }
@@ -263,6 +272,8 @@ Task { @MainActor in
     }
 }
 ```
+
+**Versioning.** 2.0.0 collects the source-breaking API changes made during review on 25 Nov 2026 (the 1.0.x tags were published and superseded the same day): `connect` returns a throwing `RelayConnection`, `RelayUplink` gains `presenceTTL` and `addViewer`, `SharerSession.init` loses `presenceTTL:`, and `Freshness` gains `.behind`. They should not have shipped as patch releases, so they are re-released under a major version.
 
 Products: `LiveLocation` (the core, no UI) and `LiveLocationUI` (the SwiftUI scenario the demo app shows). Requires iOS 17+ or macOS 14+, Swift 6 language mode.
 

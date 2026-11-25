@@ -64,7 +64,7 @@ final class RelayTests: XCTestCase {
     func testShareExpiresByTimeAndEverythingIsDeleted() async throws {
         let (relay, clock) = makeRelay()
         try await relay.startShare(s, viewers: [a, b], duration: .minutes(10))
-        let conn = await relay.connect(a)
+        let conn = try await relay.connect(a)
         _ = await relay.publish([sealedCopy("s", "a", 1), sealedCopy("s", "b", 1)])     // b is offline: queued for push
         clock.advance(by: .minutes(10))
         let afterExpiry = await relay.publish([sealedCopy("s", "a", 2)])
@@ -126,7 +126,7 @@ final class RelayTests: XCTestCase {
     func testRevocationDeletesStoredCopyAndQueuedPushAndNotifies() async throws {
         let (relay, _) = makeRelay()
         try await relay.startShare(s, viewers: [a, b], duration: .hours(1))
-        let conn = await relay.connect(a)
+        let conn = try await relay.connect(a)
         _ = await relay.publish([sealedCopy("s", "a", 1), sealedCopy("s", "b", 1)])
         await relay.revoke(b, from: s)
         await relay.revoke(a, from: s)
@@ -181,7 +181,7 @@ final class RelayTests: XCTestCase {
         try await relay.startShare(s, viewers: [a], duration: .hours(1))
         _ = await relay.publish([sealedCopy("s", "a", 1)])
         _ = await relay.publish([sealedCopy("s", "a", 2)])
-        let conn = await relay.connect(a)
+        let conn = try await relay.connect(a)
         let pendingAfterConnect = await relay.stats.pendingPushes
         XCTAssertEqual(pendingAfterConnect, 0)
         let events = await first(conn.points, count: 1)
@@ -195,7 +195,7 @@ final class RelayTests: XCTestCase {
         let other = ShareID("t")
         try await relay.startShare(s, viewers: [a], duration: .hours(1))
         try await relay.startShare(other, viewers: [a], duration: .hours(1))
-        let conn = await relay.connect(a)
+        let conn = try await relay.connect(a)
         await relay.stopShare(s)                             // "remove the pin" for share s, sent FIRST…
         for seq in 1...50 as ClosedRange<UInt64> { _ = await relay.publish([sealedCopy("t", "a", seq)]) }  // …then a burst
         let events = await first(conn.points, count: 3)
@@ -204,7 +204,7 @@ final class RelayTests: XCTestCase {
         XCTAssertEqual(control, [.ended(s, .stopped)], "a later burst of points can never evict an earlier control event")
     }
 
-    func testAJunkCopyAtAHugeSequenceCannotLockAShare() async throws {
+    func testAJunkCopyAtUInt64MaxIsRejected() async throws {
         let (relay, clock) = makeRelay()
         try await relay.startShare(s, viewers: [a], duration: .hours(1))
         let junk = await relay.publish([sealedCopy("s", "a", .max)])
@@ -216,10 +216,20 @@ final class RelayTests: XCTestCase {
         XCTAssertEqual(ahead.queuedForPush, [a], "a sharer clock up to 5 min ahead is accepted")
     }
 
+    func testConnectRefusesStrangersAndCapsConnectionsPerViewer() async throws {
+        let (relay, _) = makeRelay(RelayConfiguration(maxConnectionsPerViewer: 2))
+        await XCTAssertThrowsAsync(try await relay.connect(a), .notAViewer)
+        try await relay.startShare(s, viewers: [a], duration: .hours(1))
+        let c1 = try await relay.connect(a)
+        let c2 = try await relay.connect(a)
+        await XCTAssertThrowsAsync(try await relay.connect(a), .tooManyConnections(limit: 2))
+        _ = (c1, c2)
+    }
+
     func testDisconnectedStreamFallsBackToPush() async throws {
         let (relay, _) = makeRelay()
         try await relay.startShare(s, viewers: [a], duration: .hours(1))
-        var conn: RelayConnection? = await relay.connect(a)
+        var conn: RelayConnection? = try await relay.connect(a)
         XCTAssertNotNil(conn)
         conn = nil                                            // dropping the last reference terminates it
         for _ in 0..<200 {

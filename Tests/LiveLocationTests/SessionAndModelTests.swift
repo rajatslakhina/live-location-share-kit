@@ -7,12 +7,15 @@ actor GatedUplink: RelayUplink {
     let relay: LocationRelay
     nonisolated var presenceTTL: Millis { relay.configuration.presenceTTL }
     private var holdNext = false
+    private var holdNextRevokeCall = false
+    private(set) var revokeCalls = 0
     private var parked: [CheckedContinuation<Void, Never>] = []
     private(set) var uploads: [[SealedPoint]] = []
     var failing = false
 
     init(relay: LocationRelay) { self.relay = relay }
     func holdNextUpload() { holdNext = true }
+    func holdNextRevoke() { holdNextRevokeCall = true }
     func setFailing(_ f: Bool) { failing = f }
     func release() { parked.forEach { $0.resume() }; parked = [] }
 
@@ -27,6 +30,11 @@ actor GatedUplink: RelayUplink {
     }
 
     func revoke(_ viewer: ViewerID, from share: ShareID) async throws {
+        revokeCalls += 1
+        if holdNextRevokeCall {
+            holdNextRevokeCall = false
+            await withCheckedContinuation { parked.append($0) }
+        }
         if failing { throw URLError(.notConnectedToInternet) }
         await relay.revoke(viewer, from: share)
     }
@@ -34,6 +42,11 @@ actor GatedUplink: RelayUplink {
     func stop(_ share: ShareID) async throws {
         if failing { throw URLError(.notConnectedToInternet) }
         await relay.stopShare(share)
+    }
+
+    func addViewer(_ viewer: ViewerID, to share: ShareID) async throws {
+        if failing { throw URLError(.notConnectedToInternet) }
+        try await relay.addViewer(viewer, to: share)
     }
 }
 
@@ -83,7 +96,7 @@ final class SharerSessionTests: XCTestCase {
         guard case .published(.heartbeat, let fastSeq, _) = fast else { return XCTFail("\(fast)") }
         await uplink.release()
         let slowOutcome = await slow.value
-        guard case .published(.moved, let slowSeq, let receipt) = slowOutcome else { return XCTFail("\(slowOutcome)") }
+        guard case .rejected(let slowSeq, let receipt) = slowOutcome else { return XCTFail("\(slowOutcome)") }
         XCTAssertLessThan(slowSeq, fastSeq, "sequence numbers are assigned before the await, in call order")
         XCTAssertEqual(Set(receipt.rejected.values), [.staleSequence], "the late upload is dropped by the relay")
         let stored = await relay.latest(share, for: ViewerID("a"))?.sequence
@@ -167,14 +180,15 @@ final class SharerSessionTests: XCTestCase {
                                       clock: clock, startingSequence: 1)
         clock.advance(by: .seconds(20))
         let locked = await naive.ingest(fix(0.6, clock), conditions: walking)
-        guard case .published(_, _, let lockedReceipt) = locked else { return XCTFail("\(locked)") }
+        guard case .rejected(_, let lockedReceipt) = locked else { return XCTFail("\(locked)") }
         XCTAssertEqual(Set(lockedReceipt.rejected.values), [.staleSequence])
     }
 
     func testEpochSequenceIsMonotonicInTimeAndNeverTraps() {
         XCTAssertLessThan(SharerSession.epochSequence(Instant(millis: 1_000)), SharerSession.epochSequence(Instant(millis: 1_001)))
         XCTAssertEqual(SharerSession.epochSequence(Instant(millis: -5)), 0)
-        XCTAssertEqual(SharerSession.epochSequence(Instant(millis: .max)), UInt64.max / 2)
+        XCTAssertEqual(SharerSession.epochSequence(Instant(millis: .max)), UInt64.max, "saturates, never wraps backwards")
+        XCTAssertLessThanOrEqual(SharerSession.epochSequence(Instant(millis: 1 << 47)), SharerSession.epochSequence(Instant(millis: 1 << 50)))
     }
 
     func testSessionStopsWhenTheRelayHasForgottenTheShare() async throws {
@@ -235,8 +249,7 @@ final class SharerSessionTests: XCTestCase {
         let (session, _, relay, clock) = try await setUp()
         _ = await session.ingest(fix(0, clock), conditions: walking)
         let dana = ViewerKeys(viewerID: ViewerID("d"))
-        try await relay.addViewer(dana.viewerID, to: share)
-        try await session.addViewer(dana.viewerID, publicKey: dana.publicKey)
+        try await session.addViewer(dana.viewerID, publicKey: dana.publicKey)   // device + relay in one call
         clock.advance(by: .seconds(20))
         _ = await session.ingest(fix(0.3, clock), conditions: walking)
         var opener = PerViewerOpener(keys: dana)
@@ -264,6 +277,66 @@ final class SharerSessionTests: XCTestCase {
         let pendingRevokes = await session.unacknowledgedRevocations
         XCTAssertFalse(pendingStop)
         XCTAssertEqual(pendingRevokes, [])
+    }
+
+    func testARevokeThatFailedCannotRevokeAViewerWhoWasReAdded() async throws {
+        let (session, uplink, relay, clock) = try await setUp()
+        let carol = ViewerID("c")
+        _ = await session.ingest(fix(0, clock), conditions: walking)
+        await uplink.setFailing(true)
+        let acknowledged = await session.revoke(carol)                  // fails: queued for retry
+        XCTAssertFalse(acknowledged)
+        await uplink.setFailing(false)
+        try await session.addViewer(carol, publicKey: keys[2].publicKey)  // re-added before the retry
+        let pending = await session.unacknowledgedRevocations
+        XCTAssertEqual(pending, [], "re-adding cancels the queued revoke")
+        let revokesBefore = await uplink.revokeCalls
+        _ = await session.flushOutbox()                                // must NOT revoke her again
+        let revokesAfter = await uplink.revokeCalls
+        XCTAssertEqual(revokesAfter, revokesBefore, "no relay revoke was sent for a re-added viewer")
+        clock.advance(by: .seconds(61))
+        _ = await session.tick(conditions: walking)
+        let onShare = await relay.viewers(of: share).contains(carol)
+        XCTAssertTrue(onShare, "the stale revoke was dropped")
+        let latest = await relay.latest(share, for: carol)
+        XCTAssertNotNil(latest, "and she receives the next point")
+    }
+
+    func testAViewerReAddedWhileTheirRevokeIsInFlightIsNotQueuedForRevocation() async throws {
+        let (session, uplink, relay, clock) = try await setUp()
+        let carol = ViewerID("c")
+        _ = await session.ingest(fix(0, clock), conditions: walking)
+        await uplink.holdNextRevoke()
+        let revoking = Task { await session.revoke(carol) }               // parks inside the relay call
+        while await uplink.revokeCalls < 1 { await Task.yield() }
+        try await session.addViewer(carol, publicKey: keys[2].publicKey)   // runs at revoke's await
+        await uplink.setFailing(true)
+        await uplink.release()
+        let acknowledged = await revoking.value                          // the relay call fails…
+        XCTAssertFalse(acknowledged)
+        let pending = await session.unacknowledgedRevocations
+        XCTAssertEqual(pending, [], "…but she was re-added meanwhile, so nothing is queued to revoke her")
+        await uplink.setFailing(false)
+        _ = await session.flushOutbox()
+        let onShare = await relay.viewers(of: share).contains(carol)
+        XCTAssertTrue(onShare)
+    }
+
+    func testStopDuringAFailingUploadNeverRefillsTheOutbox() async throws {
+        let (session, uplink, _, clock) = try await setUp()
+        _ = await session.ingest(fix(0, clock), conditions: walking)
+        clock.advance(by: .seconds(20))
+        await uplink.holdNextUpload()
+        let f = fix(0.001, clock), conditions = walking
+        let inFlight = Task { await session.ingest(f, conditions: conditions) }
+        while await uplink.uploads.count < 2 { await Task.yield() }
+        await uplink.setFailing(true)
+        _ = await session.stop()
+        await uplink.release()
+        let outcome = await inFlight.value
+        XCTAssertEqual(outcome, .ended)
+        let held = await session.heldBatchRecipients
+        XCTAssertEqual(held, [])
     }
 
     func testOfflineOutboxKeepsOnlyTheNewestBatch() async throws {

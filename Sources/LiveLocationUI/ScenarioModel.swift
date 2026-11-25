@@ -17,6 +17,7 @@ actor SwitchableUplink: RelayUplink {
         if isDown { throw URLError(.notConnectedToInternet) }
         await relay.revoke(viewer, from: share)
     }
+    func addViewer(_ viewer: ViewerID, to share: ShareID) async throws { try await relay.addViewer(viewer, to: share) }
     func stop(_ share: ShareID) async throws { await relay.stopShare(share) }
 }
 
@@ -86,6 +87,7 @@ public final class ScenarioModel {
     private var revoked: Set<ViewerID> = []
     private var consumers: [Task<Void, Never>] = []
     private var sharerOnline = false
+    private var budgetRanDry = false
 
     let alice = ViewerID("alice"), bob = ViewerID("bob"), carol = ViewerID("carol")
     private let names: [ViewerID: String]
@@ -133,7 +135,7 @@ public final class ScenarioModel {
 
         // Alice and Carol keep the app open (WebSocket path). Bob is backgrounded (push path).
         for id in [alice, carol] {
-            let connection = await relay.connect(id)
+            guard let connection = try? await relay.connect(id) else { log(0, "Could not connect \(id)"); return }
             consumers.append(Task { @MainActor [weak self] in
                 for await point in connection.points { self?.receive(point, for: id) }
             })
@@ -165,7 +167,10 @@ public final class ScenarioModel {
             if second == 8 * 60 { await uplink.setDown(true); log(second, "Sharer loses network") }
             if second == 9 * 60 {
                 await uplink.setDown(false)
-                if case .published = await session.flushOutbox() { flushedAfterOutage = true }
+                if case .published(_, _, let receipt) = await session.flushOutbox() {
+                    flushedAfterOutage = true
+                    for v in receipt.deliveredLive { expectedLive[v, default: 0] += 1 }
+                }
                 log(second, "Network back: latest-wins outbox flushed (\(flushedAfterOutage ? "1 batch" : "nothing held"))")
             }
 
@@ -195,6 +200,10 @@ public final class ScenarioModel {
                 }
             }
             if case .heldOffline = outcome { log(second, "Heartbeat held offline (outbox keeps newest only)") }
+            if outcome == .suppressed(.budgetExhausted), !budgetRanDry {
+                budgetRanDry = true
+                log(second, "Battery budget spent: movement updates paused, heartbeats continue")
+            }
 
             if second % 30 == 0 {
                 for push in await relay.drainPushes() {

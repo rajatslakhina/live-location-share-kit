@@ -30,8 +30,8 @@ public struct PublishCadence: Hashable, Sendable {
     public let minInterval: Millis
     /// A movement update needs at least this displacement from the last published point.
     public let minDistanceMeters: Double
-    /// Publish even without movement after this long, so the relay's presence TTL never lapses
-    /// while the sharer is genuinely online. Always at most half the presence TTL.
+    /// Publish even without movement after this long, so the relay's presence TTL does not lapse while the
+    /// sharer is online and its timer fires promptly. Always at most half the presence TTL.
     public let heartbeatInterval: Millis
 }
 
@@ -66,8 +66,9 @@ public enum PublishPolicy {
     public static let minimumPresenceTTL = Millis.seconds(2)
 
     /// - Parameter presenceTTL: the relay's presence TTL, clamped to ≥ 2 s exactly as `RelayConfiguration`
-    ///   clamps it. The heartbeat is half of it, so one lost heartbeat still arrives within the TTL and
-    ///   does not flip the sharer to "away".
+    ///   clamps it. The heartbeat is half of it, so one lost heartbeat arrives exactly at the TTL boundary:
+    ///   that tolerates one loss only if the heartbeat timer fires promptly (each tick of timer slack is
+    ///   added to every interval).
     public static func cadence(for c: DeviceConditions, presenceTTL: Millis) -> PublishCadence {
         let b = base(c.motion)
         let k = batteryMultiplier(c)

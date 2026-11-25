@@ -8,6 +8,7 @@ public protocol RelayUplink: Sendable {
     var presenceTTL: Millis { get }
     func upload(_ copies: [SealedPoint]) async throws -> PublishReceipt
     func revoke(_ viewer: ViewerID, from share: ShareID) async throws
+    func addViewer(_ viewer: ViewerID, to share: ShareID) async throws
     func stop(_ share: ShareID) async throws
 }
 
@@ -26,6 +27,8 @@ public enum SessionError: Error, Equatable, Sendable {
 public enum IngestOutcome: Sendable, Hashable {
     case published(PublishReason, sequence: UInt64, receipt: PublishReceipt)
     case suppressed(SuppressReason)
+    /// Sealed and uploaded, but the relay accepted no copy (all stale, not a recipient, or future).
+    case rejected(sequence: UInt64, receipt: PublishReceipt)
     /// Sealed, but the uplink failed; kept in a one-slot, latest-wins outbox.
     case heldOffline(sequence: UInt64)
     /// Nothing to send (no recipients left, or no prior fix to heartbeat).
@@ -105,7 +108,8 @@ public actor SharerSession {
     public static func epochSequence(_ now: Instant) -> UInt64 {
         let ms = UInt64(clamping: max(0, now.millis))
         let (shifted, overflow) = ms.multipliedReportingOverflow(by: 1 << 16)
-        return overflow ? UInt64.max / 2 : shifted
+        // Saturate (never wrap) so the sequence stays monotonic in time; a real clock cannot get here.
+        return overflow ? UInt64.max : shifted
     }
 
     public var recipients: [ViewerID] { sealer.recipients }
@@ -119,11 +123,13 @@ public actor SharerSession {
     /// True when `stop()` could not reach the relay yet (retried by `flushOutbox`).
     public var stopUnacknowledged: Bool { pendingRelayStop }
 
-    /// Adds a viewer to the running share. Call `LocationRelay.addViewer` (or its network equivalent)
-    /// too; the next point is sealed for them.
-    public func addViewer(_ viewer: ViewerID, publicKey: Data) throws {
+    /// Adds a viewer to the running share, on the sharer's device and at the relay; the next point is
+    /// sealed for them. A revocation of the same viewer that is still pending is cancelled, so a re-added
+    /// viewer is never revoked by a stale retry.
+    public func addViewer(_ viewer: ViewerID, publicKey: Data) async throws {
         try sealer.add(viewer, publicKey: publicKey)
         pendingRelayRevocations.remove(viewer)
+        try await uplink.addViewer(viewer, to: shareID)
     }
 
     /// Feeds one fix from CoreLocation (or a simulator route).
@@ -168,7 +174,13 @@ public actor SharerSession {
         // Relay-side cleanup is retried even after the share ended: a revoke or stop that failed offline
         // must still reach the relay, or it would keep stored copies until the share expires.
         for viewer in pendingRelayRevocations.sorted() {
-            if (try? await uplink.revoke(viewer, from: shareID)) != nil { pendingRelayRevocations.remove(viewer) }
+            // Skip entries cleared since the loop started (e.g. `addViewer` ran during an earlier await).
+            guard pendingRelayRevocations.contains(viewer) else { continue }
+            if (try? await uplink.revoke(viewer, from: shareID)) != nil {
+                pendingRelayRevocations.remove(viewer)
+                // Re-added while this revoke was in flight: put them back at the relay.
+                if sealer.recipients.contains(viewer) { try? await uplink.addViewer(viewer, to: shareID) }
+            }
         }
         if pendingRelayStop, (try? await uplink.stop(shareID)) != nil { pendingRelayStop = false }
         guard !isEnded else { return .ended }
@@ -181,7 +193,8 @@ public actor SharerSession {
             if outboxSequence == seq { outbox = [] }             // a newer batch may have replaced it meanwhile
             if receipt.accepted { counters.uploaded = Saturating.add(counters.uploaded, 1) }
             if receipt.shareIsGone { endLocally(); return .ended }
-            return .published(reason, sequence: seq, receipt: receipt)
+            return receipt.accepted ? .published(reason, sequence: seq, receipt: receipt)
+                                    : .rejected(sequence: seq, receipt: receipt)
         } catch {
             return .heldOffline(sequence: seq)
         }
@@ -200,7 +213,8 @@ public actor SharerSession {
             pendingRelayRevocations.remove(viewer)
             return true
         } catch {
-            pendingRelayRevocations.insert(viewer)
+            // Only if they were not re-added (by `addViewer`) while this call was suspended.
+            if !sealer.recipients.contains(viewer) { pendingRelayRevocations.insert(viewer) }
             return false
         }
     }
@@ -241,10 +255,13 @@ public actor SharerSession {
         do {
             let receipt = try await uplink.upload(copies)
             if receipt.accepted { counters.uploaded = Saturating.add(counters.uploaded, 1) }
+            guard !isEnded else { return .ended }                            // stop() ran during the upload
             if outboxSequence <= seq { outbox = []; outboxSequence = seq }   // supersedes anything older
             if receipt.shareIsGone { endLocally(); return .ended }
-            return .published(payload.reason, sequence: seq, receipt: receipt)
+            return receipt.accepted ? .published(payload.reason, sequence: seq, receipt: receipt)
+                                    : .rejected(sequence: seq, receipt: receipt)
         } catch {
+            guard !isEnded else { return .ended }                            // never refill the outbox after stop()
             if seq > outboxSequence {
                 // Re-filter: a revoke may have run while this upload was in flight.
                 let current = Set(sealer.recipients)

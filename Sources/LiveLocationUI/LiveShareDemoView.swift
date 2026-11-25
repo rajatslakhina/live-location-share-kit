@@ -2,7 +2,7 @@ import SwiftUI
 import MapKit
 import LiveLocation
 
-/// Root view of the demo: four tabs, each backed by real library calls.
+/// Root view of the demo: five tabs, each backed by real library calls.
 public struct LiveShareDemoView: View {
     public enum Tab: String, CaseIterable, Sendable { case sharer, timeline, viewers, capacity, gate }
 

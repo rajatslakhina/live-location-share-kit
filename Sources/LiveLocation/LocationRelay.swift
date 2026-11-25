@@ -15,10 +15,13 @@ public struct RelayConfiguration: Sendable, Hashable {
     /// Per-connection point buffer. A slow foreground consumer drops its *oldest points*, never blocks the
     /// relay. Control events (revoked / ended) travel on a separate stream and are not dropped this way.
     public let connectionBuffer: Int
+    /// Open foreground connections allowed per viewer (devices/tabs). Bounds connection memory.
+    public let maxConnectionsPerViewer: Int
 
     public init(presenceTTL: Millis = .seconds(120), maxShareDuration: Millis = .hours(24),
                 maxViewersPerShare: Int = 50, maxActiveShares: Int = 10_000,
-                pushBurst: Int = 4, pushRefill: Millis = .minutes(5), connectionBuffer: Int = 32) {
+                pushBurst: Int = 4, pushRefill: Millis = .minutes(5), connectionBuffer: Int = 32,
+                maxConnectionsPerViewer: Int = 4) {
         self.presenceTTL = max(Millis.seconds(2), presenceTTL)
         self.maxShareDuration = max(Millis.seconds(1), maxShareDuration)
         self.maxViewersPerShare = max(1, maxViewersPerShare)
@@ -26,6 +29,7 @@ public struct RelayConfiguration: Sendable, Hashable {
         self.pushBurst = max(1, pushBurst)
         self.pushRefill = max(Millis(1), pushRefill)
         self.connectionBuffer = max(1, connectionBuffer)
+        self.maxConnectionsPerViewer = max(1, maxConnectionsPerViewer)
     }
 }
 
@@ -51,6 +55,9 @@ public enum RelayError: Error, Equatable, Sendable {
     case capacityReached(limit: Int)
     case duplicateShare
     case unknownShare
+    /// `connect` for a viewer who is on no share.
+    case notAViewer
+    case tooManyConnections(limit: Int)
 }
 
 public enum RejectReason: String, Sendable, Hashable {
@@ -110,7 +117,8 @@ public struct RelayStats: Sendable, Hashable {
 /// path) and budgeted, coalescing background pushes (the Live Activity path).
 ///
 /// Every method is synchronous inside the actor — there is no `await` between reading and writing state,
-/// so there is no actor-reentrancy window. Storage is bounded by `maxActiveShares × maxViewersPerShare`.
+/// so there is no actor-reentrancy window. Storage is bounded by `maxActiveShares × maxViewersPerShare`,
+/// and connections by `maxConnectionsPerViewer` for viewers who are on at least one share.
 /// Housekeeping: `sweep()` is O(1) until an expiry is due, then O(shares); per-viewer cleanup uses a
 /// viewer → shares index instead of scanning every share.
 public actor LocationRelay {
@@ -295,7 +303,13 @@ public actor LocationRelay {
     /// Opens a foreground connection for `viewer` (the WebSocket path). The latest stored copy of every
     /// share the viewer is on is replayed first, and anything queued for push is delivered here instead.
     /// A reconnecting viewer reconciles pins for shares that ended while it was away with `shares(for:)`.
-    public func connect(_ viewer: ViewerID) -> RelayConnection {
+    /// Throws `notAViewer` for a viewer on no share and `tooManyConnections` past the per-viewer cap.
+    public func connect(_ viewer: ViewerID) throws -> RelayConnection {
+        _ = sweep()
+        guard viewerShares[viewer]?.isEmpty == false else { throw RelayError.notAViewer }
+        guard (connections[viewer]?.count ?? 0) < configuration.maxConnectionsPerViewer else {
+            throw RelayError.tooManyConnections(limit: configuration.maxConnectionsPerViewer)
+        }
         let (points, pointsCont) = AsyncStream.makeStream(
             of: SealedPoint.self, bufferingPolicy: .bufferingNewest(configuration.connectionBuffer))
         let (control, controlCont) = AsyncStream.makeStream(
